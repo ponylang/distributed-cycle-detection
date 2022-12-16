@@ -1,0 +1,48 @@
+<?xml version="1.0"?>
+<alloy>
+
+<view nodetheme="Martha">
+
+<defaultnode/>
+
+<defaultedge/>
+
+<node>
+   <type name="Int"/>
+   <type name="String"/>
+   <type name="univ"/>
+   <type name="seq/Int"/>
+</node>
+
+<node shape="Box" color="Blue" label="TraceElement">
+   <type name="Models/TraceElement"/>
+</node>
+
+<node shape="Ellipse" color="Yellow" label="Actor">
+   <type name="Models/Actor"/>
+</node>
+
+<node shape="Lined Diamond" color="Gray" label="StateChanges">
+   <type name="StateChanges/StateChanges"/>
+</node>
+
+<node shape="Parallelogram" color="Green" label="Connection">
+   <type name="Models/Connection"/>
+</node>
+
+<node style="Solid" shape="Box" color="Blue" label="Trace">
+   <type name="Models/Trace"/>
+</node>
+
+<edge color="Black">
+   <relation name="conn"> <type name="Models/Trace"/> <type name="Models/Connection"/> </relation>
+</edge>
+
+<edge color="Blue">
+   <relation name="prior"> <type name="Models/TraceElement"/> <type name="Models/Trace"/> </relation>
+   <relation name="prior"> <type name="Models/TraceElement"/> <type name="Models/TraceElement"/> </relation>
+</edge>
+
+</view>
+
+</alloy>
