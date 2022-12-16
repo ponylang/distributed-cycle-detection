@@ -1,0 +1,8 @@
+- "connection" needs to be defined better
+- "merge" isn't documented
+- "reset" isn't documented, what's here is off and not fully in my head anymore
+- rename "possible cycle" to cycle
+- rename "possible cycle where actor didn't originate" to X
+- rename "merged" as "connected components"
+- everything needs to be tested against a fully connected actor setup
+- there's overlap in terminology between ORCA and this protocol. This protocol needs unique names that are clearly defined. For example "connection" is good for usage in the protocol because, it has no meaning in ORCA.

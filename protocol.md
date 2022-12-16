@@ -1,12 +1,16 @@
 ## Finding cycles
 
-- During a scheduler run, if an actor has received a new actor reference, it will check to see if it should start a trace.
+A => B => C
+
+- During a scheduler run, if an actor has received a new actor reference, it will check to see if it should start a trace. (i think it always starts a trace)
 - Trace messages are in the form (ACTOR,ACTOR,etc) where each actor in the trace adds itself to the trace list. If actor A started a trace the message would be (A). If it sends to actor B that sends along, B would send (A,B)
 - A trace will be sent on each reference connection if it hasn't sent the same message on that connection previously
 - If a message arrives back at the actor that originated it, then it is a "possible cycle"
+- When a possible cycle is found, the actor finding the cycle informs the other members of the possible cycle.
 - TRACE message sending ends when a possible cycle is found
-- If an actor receives a release for an actor, any "connection" info about messages sent is reset in case a new actor gets the same id.
-- If an actor receives a release for an actor that is part of a possible cycle, then it should remove the cycle from its list of cycles and inform all members of the cycle set that the cycle is no longer valid.
+- TRACE message also ends if an actor will appear twice but it isn't the originating actor. These are "dropped".
+- If an actor gc releases (0) another actor, any "connection" info about messages sent is reset in case a new actor gets the same id.
+- If an actor gc releases (0) another actor that is part of a possible cycle, then it should remove the cycle from its list of cycles and inform all members of the cycle set that the cycle is no longer valid.
 - Each "connection" that was part of a removed cycle probably needs to be "reset"
 - Each "connection" probably needs a epoch of some type. (tbd)
 - Each message probably needs to include the connection epoch (tbd)
