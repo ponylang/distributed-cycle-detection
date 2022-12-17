@@ -13,7 +13,7 @@ ACTOR IDENTIFIERS are not guaranteed to be unique across the lifetime of an appl
 
 A special runtime message that is used to find cycles amongst actor relationships.
 
-Cycles are found by sending TRACE ROUTE messages from actor to actor and using the results to find routes that circle back on themselves. Found cycles can be merged together to find larger connected components. A connected component is composed of 1 or more cycles.
+Cycles are found by sending TRACE ROUTE messages from actor to actor and using the results to find routes that circle back on themselves. Found cycles can be can be used to find larger connected components that share some members between different cycles. A connected component is composed of 1 or more cycles.
 
 The same cycle can be found from multiple different starting points. For example, "A to B to C to A" is the same cycle as "C to A to B to C".
 
@@ -59,11 +59,9 @@ If when examining the TRACE ROUTE message for its own ACTOR IDENTIFIER, the acto
 
 Cycles are independent of route. That is, cycle (A,B) is the same as cycle (B,A). What is important is the equivalence of members, not the order. With routes in a TRACE MESSAGE order matters for determing if to send, but it doesn't matter for noting "new cycles".
 
-Upon finding a cycle, the actor that found the cycle checks its known cycle to see if the newly found cycle is the same as or a subset of any known cycle. If the cycle is already part of known cycle, then it is discarded and nothing further happens.
+Upon finding a cycle, the actor that found the cycle checks its set of known cycles to see if the newly found cycle is the same as or a subset of any known cycle. If the cycle is known then no further processing happens for the TRACE ROUTE message.
 
-When an actor finds a new cycle, it takes its existing known cycle and merges the new elements into the known cycle. The known cycle is the larger connected component. The "known cycle" is a pairing of ACTOR IDENTIFIER and a count. The count will normally be one except where an actor is a "join point" between cycles that form a connected component. For example if actor C already knows about a cycle that is A, B, C where each has a count of 1 and C finds a new cycle C, D, E then the final outcome of the merge is A, B, D, E with counts of 1 and C with a count of 2.
-
-Upon finding a new cycle and completing the merge, the finding actor informs all the actors in connected component of the newly updated information.
+When an actor finds a new cycle, it adds it to its set of known cycles. Upon finding a new cycle, the finding actor informs all the actors in connected component of the full set of cycles that represents the connected component. That is, each actor that appears as a member of any known cycle is informed of all known cycles that make up the larger connected component.
 
 ## Leadership determination
 
