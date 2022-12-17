@@ -9,6 +9,8 @@ given actor such as a guid or the memory address the actor occupies.
 
 ACTOR IDENTIFIERS are not guaranteed to be unique across the lifetime of an application but we do guarantee that two actors that exist at the same time will not share an identifier.
 
+ACTOR IDENTIFIERS need to be sortable such that one can say "this identifier is less than this other one".
+
 ### TRACE ROUTE message
 
 A special runtime message that is used to find cycles amongst actor relationships.
@@ -65,11 +67,12 @@ When an actor finds a new cycle, it adds it to its set of known cycles. Upon fin
 
 ## Leadership determination
 
-- Leadership for a cycle is initially determined locally
-- A leader can delegate leadership to a different member of the possible cycle
-- If two cycles are merged together, a new leadership "election" happens.
-- The leader is the actor that appears in the cycle most often
-- If more than 1 actor has the same number of appearances, the actor with the lowest memory address is the leader
+- Leadership for a connected component is initially determined locally
+- Each time a connected component has a state change, leadership is redetermined locally
+- Locally the only determination is "I am the leader" or "I am not the leader"
+- A leader can delegate leadership to a different member of the connected component
+- The leader is the actor that appears in the connected component most often
+- If more than 1 actor has the same number of appearances, the actor with the lowest ACTOR IDENTIFIER is the leader
 
 ## Cycle confirmation
 
