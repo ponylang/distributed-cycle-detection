@@ -57,7 +57,7 @@ actor Main
     // // A is cycle leader.
     // // A sees that it rc of 1 matches its number of occurrences in the set, and that its queue is empty
     // // A sends CONFIRM BLOCKED to C and B for (C,B,A)
-    // // C and B both have rc of 1, empty queues, and all members of the cycle set are in their respective actor maps. C and B both send CONFIRMED messages to A
+    // // C and B both have rc of 1, empty queues C and B both send CONFIRMED messages to A
     // // A receives both confirmed messages.
     // // A sends RELEASE (C,A,B) to B and C
     // // A does GC release of all members of the set in its actormap
