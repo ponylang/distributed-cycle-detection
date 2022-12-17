@@ -43,6 +43,11 @@
    <relation name="prior"> <type name="Models/TraceElement"/> <type name="Models/TraceElement"/> </relation>
 </edge>
 
+<edge style="inherit" visible="no" attribute="yes">
+   <relation name="inMap"> <type name="Models/Actor"/> <type name="Models/Actor"/> </relation>
+   <relation name="inMem"> <type name="Models/Actor"/> <type name="Models/Actor"/> </relation>
+</edge>
+
 </view>
 
 </alloy>

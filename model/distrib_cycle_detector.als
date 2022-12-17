@@ -12,6 +12,9 @@ pred example {
 
   #Actor = 1
   Actor.isActive = Actor // (all initial actors begin as active)
+  no Actor.inMap
+  no Actor.inMem
+
   no Connection
   no Trace
 
@@ -19,9 +22,10 @@ pred example {
   // Desired state change sequence, if any.
 
   some StateChanges.willSpawnActorFrom
-  after some StateChanges.willSpawnActorFrom
+  after some StateChanges.willReduceMemOf
   after after some StateChanges.willSpawnActorFrom
   after after after some StateChanges.willSpawnActorFrom
+  eventually some a: Actor | #a.inMap = 3
 
   ///
   // Safety checks.

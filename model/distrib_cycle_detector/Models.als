@@ -6,6 +6,16 @@ module pony/distrib_cycle_detector/Models
 var sig Actor {
   var isActive: lone Actor,
   var isDestroyed: lone Actor,
+
+  // This is the set of actor references currently held in memory of the actor.
+  // This includes both stack memory (local variables) and heap memory (fields).
+  // At the end of a behavior, there is no more stack memory - only heap memory.
+  // But we make no distinction between the two here in the model; it's one set.
+  var inMem: set Actor,
+
+  // This is the "actor map" that is within each actor in the existing runtime.
+  // It is always a superset of the actor references that are in memory.
+  var inMap: set Actor,
 }
 
 fact "an actor always has exactly protocol status pointing to itself" {
@@ -16,6 +26,15 @@ fact "an actor always has exactly protocol status pointing to itself" {
 }
 
 pred unchanged[a: Actor] {
+  a in Actor
+  a in Actor'
+  a.isActive' = a.isActive
+  a.isDestroyed' = a.isDestroyed
+  a.inMap' = a.inMap
+  a.inMem' = a.inMem
+}
+
+pred unchangedExceptMapAndMem[a: Actor] {
   a in Actor
   a in Actor'
   a.isActive' = a.isActive
