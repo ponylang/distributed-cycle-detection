@@ -47,6 +47,30 @@ pred unchangedActors {
 }
 
 ///
+// An AppMessage carries application-level data from one Actor to another.
+
+var sig AppMessage {
+  // This is the recipient of the message.
+  var to: Actor,
+
+  // This is the set of actor references that are in the message arguments.
+  // For the purpose of this model we ignore the all other data in the message.
+  var inArgs: set Actor,
+}
+
+pred unchanged[m: AppMessage] {
+  m in AppMessage
+  m in AppMessage'
+  m.to' = m.to
+  m.inArgs' = m.inArgs
+}
+
+pred unchangedAppMessages {
+  AppMessage' = AppMessage
+  all m: AppMessage | unchanged[m]
+}
+
+///
 // A Connection represents one Actor's knowledge about another Actor.
 
 var sig Connection {

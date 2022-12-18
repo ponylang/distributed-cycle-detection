@@ -19,11 +19,15 @@ one sig StateChanges {
   var willNotChange: lone StateChanges,
   var willSpawnActorFrom: lone Actor,
   var willReduceMemOf: lone Actor,
+  var willSendAppMessageFrom: lone Actor,
+  var willReceiveAppMessage: lone AppMessage,
 } {
   always {
     willNotChange = (willNotChange implies StateChanges else none)
     willSpawnActorFrom = { a: Actor | willSpawnActorFrom[a] }
     willReduceMemOf = { a: Actor | willReduceMemOf[a] }
+    willSendAppMessageFrom = { a: Actor | willSendAppMessageFrom[a] }
+    willReceiveAppMessage = { m: AppMessage | willReceiveAppMessage[m] }
   }
 }
 
@@ -34,6 +38,8 @@ pred stateChange {
   willNotChange
     or (one a: Actor | willSpawnActorFrom[a])
     or (one a: Actor | willReduceMemOf[a])
+    or (one a: Actor | willSendAppMessageFrom[a])
+    or (one m: AppMessage | willReceiveAppMessage[m])
 }
 
 // It's always possible to pass a step that doesn't
@@ -43,6 +49,7 @@ pred stateChange {
 // kind of "no operation" state without changes.
 pred willNotChange {
   unchangedActors
+  unchangedAppMessages
   unchangedConnections
   unchangedTraces
 }
@@ -84,6 +91,7 @@ pred willSpawnActorFrom[spawnerActor: Actor] {
   all existing: Connection | unchanged[existing]
 
   // Other entities are not changed in any way.
+  unchangedAppMessages
   unchangedTraces
 }
 
@@ -107,6 +115,63 @@ pred willReduceMemOf[actor: Actor] {
   // All existing actors other than the spawner actor are unchanged.
   Actor' = Actor
   all existing: (Actor - actor) | unchanged[existing]
+
+  // Other entities are not changed in any way.
+  unchangedAppMessages
+  unchangedConnections
+  unchangedTraces
+}
+
+///
+// An actor may send an application message containing one or more actor references.
+
+pred willSendAppMessageFrom[senderActor: Actor] {
+  one newMessage: AppMessage' {
+    newMessage not in AppMessage
+    AppMessage' = AppMessage + newMessage
+
+    // All actor references in the message must be from the sender's memory,
+    // or it must be a reference to the sending actor itself.
+    newMessage.inArgs' in (senderActor.inMem + senderActor)
+
+    one receiverActor: Actor {
+      newMessage.to' = receiverActor
+    }
+  }
+
+  // All existing app messages are unchanged.
+  all existing: AppMessage | unchanged[existing]
+
+  // Other entities are not changed in any way.
+  unchangedActors
+  unchangedConnections
+  unchangedTraces
+}
+
+///
+// An actor may receive an application message to obtain its actor references.
+
+pred willReceiveAppMessage[message: AppMessage] {
+  // The message gets removed as it is processed.
+  message not in AppMessage'
+  AppMessage' = AppMessage - message
+
+  one receiverActor: message.to {
+    // The receiving actor accepts the actor references into its actor map,
+    // and into its memory (excluding itself if it was in the arguments).
+    receiverActor.inMap' = receiverActor.inMap + message.inArgs - receiverActor
+    receiverActor.inMem' = receiverActor.inMem + message.inArgs - receiverActor
+
+    // The receiving actor is otherwise unchanged.
+    unchangedExceptMapAndMem[receiverActor]
+  }
+
+  // All existing app messages (other than the processed one) are unchanged.
+  all existing: (AppMessage - message) | unchanged[existing]
+
+  // All existing actors (other than the receiving one) are unchanged.
+  Actor' = Actor
+  all existing: (Actor - message.to) | unchanged[existing]
 
   // Other entities are not changed in any way.
   unchangedConnections
