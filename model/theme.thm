@@ -12,6 +12,10 @@
    <type name="String"/>
    <type name="univ"/>
    <type name="seq/Int"/>
+   <set name="this/A" type="Models/Actor"/>
+   <set name="this/B" type="Models/Actor"/>
+   <set name="this/C" type="Models/Actor"/>
+   <set name="this/Main" type="Models/Actor"/>
 </node>
 
 <node shape="Box" color="Blue" label="TraceElement">
@@ -20,6 +24,10 @@
 
 <node shape="Ellipse" color="Yellow" label="Actor">
    <type name="Models/Actor"/>
+</node>
+
+<node shape="House" color="White" label="AppMessage">
+   <type name="Models/AppMessage"/>
 </node>
 
 <node shape="Lined Diamond" color="Gray" label="StateChanges">
@@ -46,6 +54,15 @@
 <edge style="inherit" visible="no" attribute="yes">
    <relation name="inMap"> <type name="Models/Actor"/> <type name="Models/Actor"/> </relation>
    <relation name="inMem"> <type name="Models/Actor"/> <type name="Models/Actor"/> </relation>
+</edge>
+
+<edge visible="no">
+   <relation name="isActive"> <type name="Models/Actor"/> <type name="Models/Actor"/> </relation>
+</edge>
+
+<edge visible="no" attribute="yes">
+   <relation name="inArgs"> <type name="Models/AppMessage"/> <type name="Models/Actor"/> </relation>
+   <relation name="to"> <type name="Models/Connection"/> <type name="Models/Actor"/> </relation>
 </edge>
 
 </view>
