@@ -34,8 +34,11 @@
    <type name="Models/Connection"/>
 </node>
 
-<node style="Dashed" shape="House" color="White" label="AppMessage">
+<node shape="House" shape="House" color="White" label="Message">
    <type name="Models/Message"/>
+</node>
+
+<node style="Dashed" shape="House" color="White" label="AppMessage">
    <type name="Models/AppMessage"/>
 </node>
 
@@ -69,6 +72,7 @@
 </edge>
 
 <edge visible="no" attribute="yes">
+   <relation name="id"> <type name="Models/Actor"/> <type name="Int"/> </relation>
    <relation name="to"> <type name="Models/Connection"/> <type name="Models/Actor"/> </relation>
 </edge>
 
