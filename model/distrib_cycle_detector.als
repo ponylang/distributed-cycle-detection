@@ -9,6 +9,7 @@ one var sig Main in Actor {}
 lone var sig A in Actor {}
 lone var sig B in Actor {}
 lone var sig C in Actor {}
+fact { disj[Main, A, B, C] }
 
 fact "initial conditions" {
   Actor = Main
@@ -16,7 +17,7 @@ fact "initial conditions" {
   no Actor.inMap
   no Actor.inMem
 
-  no AppMessage
+  no Message
   no Connection
   no Trace
 }
@@ -56,4 +57,11 @@ pred example {
   // Enable one of these below to search for safety violations.
 
   // eventually not noDanglingActors
+}
+
+check actorQueueStructure for 2 but 5 Message, 7 steps
+assert actorQueueStructure {
+  // An Actor always has exactly one enqueue target, implying that it always
+  // can accept a message, and never has diverging/forking queues.
+  always all a: Actor | one a.enqueueTarget
 }
