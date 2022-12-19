@@ -49,7 +49,7 @@ pred stateChange {
 // kind of "no operation" state without changes.
 pred willNotChange {
   unchangedActors
-  unchangedAppMessages
+  unchangedMessages
   unchangedConnections
   unchangedTraces
 }
@@ -91,7 +91,7 @@ pred willSpawnActorFrom[spawnerActor: Actor] {
   all existing: Connection | unchanged[existing]
 
   // Other entities are not changed in any way.
-  unchangedAppMessages
+  unchangedMessages
   unchangedTraces
 }
 
@@ -117,7 +117,7 @@ pred willReduceMemOf[actor: Actor] {
   all existing: (Actor - actor) | unchanged[existing]
 
   // Other entities are not changed in any way.
-  unchangedAppMessages
+  unchangedMessages
   unchangedConnections
   unchangedTraces
 }
@@ -134,9 +134,8 @@ pred willSendAppMessageFrom[senderActor: Actor] {
     // or it must be a reference to the sending actor itself.
     newMessage.inArgs' in (senderActor.inMem + senderActor)
 
-    one receiverActor: Actor {
-      newMessage.to' = receiverActor
-    }
+    // Send it to an Actor.
+    one a: Actor | newMessage.sendTo[a]
   }
 
   // All existing app messages are unchanged.
@@ -152,11 +151,11 @@ pred willSendAppMessageFrom[senderActor: Actor] {
 // An actor may receive an application message to obtain its actor references.
 
 pred willReceiveAppMessage[message: AppMessage] {
-  // The message gets removed as it is processed.
-  message not in AppMessage'
-  AppMessage' = AppMessage - message
+  message.receiveNow
 
-  one receiverActor: message.to {
+  one receiverActor: Actor {
+    message.enqueued = receiverActor
+
     // The receiving actor accepts the actor references into its actor map,
     // and into its memory (excluding itself if it was in the arguments).
     receiverActor.inMap' = receiverActor.inMap + message.inArgs - receiverActor
@@ -166,12 +165,9 @@ pred willReceiveAppMessage[message: AppMessage] {
     unchangedExceptMapAndMem[receiverActor]
   }
 
-  // All existing app messages (other than the processed one) are unchanged.
-  all existing: (AppMessage - message) | unchanged[existing]
-
   // All existing actors (other than the receiving one) are unchanged.
   Actor' = Actor
-  all existing: (Actor - message.to) | unchanged[existing]
+  all existing: (Actor - message.enqueued) | unchanged[existing]
 
   // Other entities are not changed in any way.
   unchangedConnections
