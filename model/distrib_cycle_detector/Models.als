@@ -1,9 +1,13 @@
+open util/integer
+
 module pony/distrib_cycle_detector/Models
 
 ///
 // An Actor is an entity that can send and receive messages.
 
 var sig Actor {
+  var id: disj one Int,
+
   var isActive: lone Actor,
   var isDestroyed: lone Actor,
 
@@ -28,6 +32,7 @@ fact "an actor always has exactly protocol status pointing to itself" {
 pred unchanged[a: Actor] {
   a in Actor
   a in Actor'
+  a.id' = a.id
   a.isActive' = a.isActive
   a.isDestroyed' = a.isDestroyed
   a.inMap' = a.inMap
@@ -37,6 +42,7 @@ pred unchanged[a: Actor] {
 pred unchangedExceptMapAndMem[a: Actor] {
   a in Actor
   a in Actor'
+  a.id' = a.id
   a.isActive' = a.isActive
   a.isDestroyed' = a.isDestroyed
 }
@@ -53,6 +59,10 @@ fun enqueueTarget[a: Actor]: (Actor + Message) {
   // or diverging queues) but because of the rest of the logic in the model,
   // we don't expect that to happen
   { t: a.*~enqueued | no t.~enqueued }
+}
+
+fun chooseLowestId[actors: Actor]: Actor {
+  { a: actors | a.id = min[actors.id] }
 }
 
 ///
