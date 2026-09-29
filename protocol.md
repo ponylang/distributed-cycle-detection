@@ -1,39 +1,79 @@
 # Distributed cycle detection protocol
 
+## Motivation
+
+The current centralized cycle detector is a single actor that becomes a bottleneck under high actor churn. Actors are created faster than the CD can reap them, leading to OOM (ponyc#6181). The CD's message queue grows without bound because every non-orphan actor with rc=0 must send a BLK message to it.
+
+Short-term fixes (batching, adaptive scheduling, sharding) don't solve the problem — they delay it. The only fix is eliminating the central bottleneck: actors detect cycles among themselves and coordinate their own destruction via message passing.
+
+## Design constraints
+
+- All coordination via message passing. No atomics, no locks, no shared mutable state.
+- The distributed protocol is one of three coexisting runtime options (selected by flag):
+  - Centralized CD (current default): proven, works for stable topologies
+  - Distributed protocol: scales under churn
+  - No cycle detection (ponynoblock): zero overhead, programmer guarantees no cycles
+- Each option survives as long as it has a use case.
+
 ## Terminology
 
 ### ACTOR IDENTIFIER
 
-An ACTOR IDENTIFIER is used to denote a given instance of an actor. Actor identifier are expected to be a combination of a "semi-unique identifier" for a
-given actor such as a guid or the memory address the actor occupies.
+An ACTOR IDENTIFIER denotes a given instance of an actor. Actor identifiers are expected to be a combination of a "semi-unique identifier" for a given actor such as a guid or the memory address the actor occupies.
 
 ACTOR IDENTIFIERS are not guaranteed to be unique across the lifetime of an application but we do guarantee that two actors that exist at the same time will not share an identifier.
 
 ACTOR IDENTIFIERS need to be sortable such that one can say "this identifier is less than this other one".
 
+### CONNECTION
+
+A CONNECTION represents one actor's knowledge of and relationship with another actor. A CONNECTION is directional: from the actor that holds the reference to the actor being referenced.
+
+Each CONNECTION is identified by the target ACTOR IDENTIFIER. A CONNECTION carries state used by the protocol: the trace history (which TRACE ROUTE messages have been forwarded on this connection) and participation in known cycles.
+
+When an actor GC releases another actor to rc 0, the CONNECTION to that actor is reset — all trace history and cycle state associated with that CONNECTION is cleared. This prevents stale state from persisting when ACTOR IDENTIFIERS are reused.
+
+### EPOCH
+
+Each actor maintains a single monotonic EPOCH counter. The EPOCH is included in protocol messages sent by the actor. The EPOCH is only meaningful to the actor that owns it — other actors carry it but do not interpret it.
+
+When a protocol message returns to the actor that originated it, the actor checks if the EPOCH in the message matches its current EPOCH. If the EPOCHs do not match, the message reflects stale state and is discarded.
+
+The EPOCH increments when the actor's state changes in a way that invalidates existing in-flight protocol messages (e.g., its connection set changes). The exact set of state changes that trigger an EPOCH increment is a design question to be resolved through formal modeling.
+
 ### TRACE ROUTE message
 
-A special runtime message that is used to find cycles amongst actor relationships.
+A special runtime message used to find cycles amongst actor relationships.
 
-Cycles are found by sending TRACE ROUTE messages from actor to actor and using the results to find routes that circle back on themselves. Found cycles can be can be used to find larger connected components that share some members between different cycles. A connected component is composed of 1 or more cycles.
+Cycles are found by sending TRACE ROUTE messages from actor to actor and using the results to find routes that circle back on themselves. Found cycles can be used to find larger connected components that share some members between different cycles. A connected component is composed of 1 or more cycles.
 
 The same cycle can be found from multiple different starting points. For example, "A to B to C to A" is the same cycle as "C to A to B to C".
 
-TRACE ROUTE messages are an ordered list of ACTOR IDENTIFIERS.
+TRACE ROUTE messages are an ordered list of entries, where each entry is an (ACTOR IDENTIFIER, EPOCH) pair.
 
-For example, if actor A initiates a trace to actor B then the TRACE ROUTE message is in the form of (A) where "A" is the ACTOR IDENTIFIER for the sending actor A.
+For example, if actor A (at epoch 5) initiates a trace to actor B then the TRACE ROUTE message is in the form of ((A,5)) where "A" is the ACTOR IDENTIFIER and "5" is A's current EPOCH.
 
-### initiate a trace
+### Initiate a trace
 
-The actor of creating a new trace message and sending it to another actor.
+The act of creating a new TRACE ROUTE message and sending it to another actor.
 
-### outgoing reference/outgoing connection
+### Outgoing reference / outgoing connection
 
 A reference from one actor to another where the first actor is able to send messages to the other.
 
-### passing along a TRACE ROUTE message
+### Passing along a TRACE ROUTE message
 
-The act of an actor taking a received TRACE ROUTE message, augmenting it with the actor's own ACTOR INDENTIFIER and sending to an actor that is an outgoing connection.
+The act of an actor taking a received TRACE ROUTE message, augmenting it with the actor's own (ACTOR IDENTIFIER, EPOCH) entry, and sending to an actor that is an outgoing CONNECTION.
+
+## Self-reap of non-cyclic actors
+
+In the distributed model, there is no central cycle detector actor holding raw pointers to actors via deltas. An actor with rc=0 and an empty message queue can self-reap — the same criterion already used by orphaned actors and ponynoblock mode.
+
+ORCA guarantees that rc=0 means no foreign references and no in-flight messages carrying a reference to this actor. No other entity in the distributed model holds a raw pointer to the actor. Self-reap is safe.
+
+When a self-reaping actor runs sendrelease, actors it referenced may see their rc drop to 0 and also self-reap. This cascading effect handles trees, DAGs, and isolated actors — everything except actual cycles.
+
+This alone addresses the primary bottleneck in ponyc#6181: short-lived actors whose rc was ever above 0 no longer need to go through any central actor to be reaped.
 
 ## Protocol stages
 
@@ -41,29 +81,40 @@ There are several stages to finding and reaping strongly connected actor compone
 
 ### Finding cycles
 
-If the actor has receives any new actor references for an actor it doesn't already have a reference to then it initiates a new TRACE ROUTE message to the newly received actor.
+When an actor receives a new actor reference for an actor it doesn't already have a CONNECTION to, it initiates a new TRACE ROUTE message to the newly received actor.
+
+Note: the trigger for trace initiation (on reference acquisition vs. on block vs. batched on block) is a design choice that should be evaluated empirically. The current design uses on-acquisition (eager discovery), but the protocol mechanism is independent of the trigger policy:
+
+- **On acquisition** (current choice): early topology discovery, higher message traffic during active execution, faster reap once actors block
+- **On block**: zero protocol overhead during active execution, discovery delayed until idle
+- **Batched on block**: accumulate new references during active execution, send traces only when blocking
 
 Upon receipt of a TRACE ROUTE message, an actor follows the TRACE ROUTE message handling steps.
 
 ### TRACE ROUTE message handling
 
-Upon receipt of a trace route message, the following algorithm is applied:
+Upon receipt of a TRACE ROUTE message, the following algorithm is applied:
 
-If the actor receiving the message has no outgoing references, nothing is done. An actor will no outgoing messages can be attached to a cycle but can not by definition be part of a cycle itself as it has no outgoing connections.
+If the receiving actor has no outgoing CONNECTIONs, nothing is done. An actor with no outgoing CONNECTIONs can be referenced by a cycle but cannot be part of a cycle itself.
 
-If the actor receiving the message has outgoing connections, then we take the following possible steps:
+If the receiving actor has outgoing CONNECTIONs, then:
 
-The receiving actor examines the TRACE ROUTE message to see if its own ACTOR IDENTIFIER is in the ordered list of identifiers for the message. If the actor doesn't find its own identifier, then it passes along that message where passing along is handled as follows:
+The receiving actor examines the TRACE ROUTE message to see if its own ACTOR IDENTIFIER is in the ordered list. If the actor doesn't find its own identifier, then it passes along the message as follows:
 
-The message is augmented by adding the receiving actor's ACTOR IDENTIFIER to the end of identifier list. If the resulting trace message chain has already been sent from the receiving actor to the actor on the other end of the outgoing reference then, the receiving actor does not send the message. If it hasn't been sent, then receiving actor sends the TRACE ROUTE message to its outgoing connection and notes in state for that outgoing connection that it has sent the TRACE ROUTE message.
+The message is augmented by adding the receiving actor's (ACTOR IDENTIFIER, EPOCH) entry to the end of the list. If the resulting trace message chain has already been sent from the receiving actor to the actor on the other end of the outgoing CONNECTION, the receiving actor does not send the message. If it hasn't been sent, the receiving actor sends the TRACE ROUTE message to its outgoing CONNECTION and records in the CONNECTION state that it has sent this trace chain.
 
-If when examining the TRACE ROUTE message for its own ACTOR IDENTIFIER, the actor found its own identifier, then a cycle has been found. There are two basic patterns of ACTOR IDENTIFIERS in a TRACE ROUTE message that should be seen. The first, is where an actor A receives a message where it is the first ACTOR IDENTIFIER in the message list. That is, it is the originating actor for the trace. In this case, the route in the received TRACE ROUTE message in the cycle in question. The other case, is slightly more complicated. It is possible that an actor that is connected to the cycle but isn't known to be part of the cycle originated the message. In that case, the "cycle" is a subset of a route in the TRACE ROUTE message. For example, if actor A received a message with (E,A,B) then the cycle is (A,B).
+If the receiving actor finds its own ACTOR IDENTIFIER in the TRACE ROUTE message, then a cycle has been found. The actor first checks the EPOCH in the entry: if the EPOCH does not match the actor's current EPOCH, the trace is stale and is discarded. If the EPOCH matches, the cycle is real.
 
-Cycles are independent of route. That is, cycle (A,B) is the same as cycle (B,A). What is important is the equivalence of members, not the order. With routes in a TRACE MESSAGE order matters for determing if to send, but it doesn't matter for noting "new cycles".
+There are two patterns for cycle discovery:
 
-Upon finding a cycle, the actor that found the cycle checks its set of known cycles to see if the newly found cycle is the same as or a subset of any known cycle. If the cycle is known then no further processing happens for the TRACE ROUTE message.
+1. The actor is the first ACTOR IDENTIFIER in the list — it originated the trace. The full route is the cycle.
+2. The actor appears later in the list — an actor outside the cycle originated the trace. The cycle is the subset of the route from the actor's entry to the end. For example, if actor A receives a message with (E,A,B) then the cycle is (A,B).
 
-When an actor finds a new cycle, it adds it to its set of known cycles. Upon finding a new cycle, the finding actor informs all the actors in connected component of the full set of cycles that represents the connected component. That is, each actor that appears as a member of any known cycle is informed of all known cycles that make up the larger connected component.
+Cycles are independent of route order. Cycle (A,B) is the same as cycle (B,A). Member equivalence is what matters, not order. Route order matters for deduplication (whether to send) but not for cycle identity.
+
+Upon finding a cycle, the actor checks its set of known cycles to see if the newly found cycle is the same as or a subset of any known cycle. If the cycle is known then no further processing happens.
+
+When an actor finds a new cycle, it adds it to its set of known cycles. The finding actor informs all actors in the connected component of the full set of cycles that represents the connected component. Each actor that appears as a member of any known cycle is informed of all known cycles.
 
 ## Leadership determination
 
@@ -77,21 +128,22 @@ When an actor finds a new cycle, it adds it to its set of known cycles. Upon fin
 ## Cycle confirmation
 
 - If at the end of any scheduler run, the leader of a cycle has an empty queue and rc equal to the number of times it appears in the cycle then it will initiate a CONFIRM BLOCKED.
-- CONFIRM BLOCKED involves send a message from the leader to each member of the cycle with the cycle to confirm
-- If receiver has an empty queue, an rc equal to the number of times it is in the cycle then it will send a CONFIRMED message to the leader. If any of the checks fails, it will send a DENIED to the leader.
+- CONFIRM BLOCKED involves sending a message from the leader to each member of the cycle with the cycle to confirm.
+- If receiver has an empty queue, and rc equal to the number of times it is in the cycle, then it will send a CONFIRMED message to the leader. If any of the checks fail, it will send a DENIED to the leader.
 - If any actor sends back DENIED, then the leader will make the first DENIED sender the new leader via a DELEGATE message.
-- If all members send back CONFIRMED then the cycle is confirmed
+- If all members send back CONFIRMED then the cycle is confirmed.
+
+Note: cycle members cannot self-reap during the confirmation window. A cycle member's rc is held above 0 by the other members' references. A member's rc can only drop to 0 during cycle destruction (after RELEASE). If the cycle breaks (an external actor drops a reference, or a member gets new work), the confirmation check (rc equals cycle appearance count) will fail and the member sends DENIED.
 
 ## Cycle destruction
 
 - Leader sends RELEASE to all other members of the cycle set
 - Leader does a GC release of any member of the set that is in its actor map
 - Each member responds to RELEASE by doing a GC release of any member of the set that is in its actor map
+- After GC releases, members' rc values drop. Members whose rc reaches 0 with empty queues self-reap.
 
-## OLD NOTES, NEED ORGANIZATION
+## CONNECTION lifecycle
 
-- If an actor gc releases (0) another actor, any "connection" info about messages sent is reset in case a new actor gets the same id.
-- If an actor gc releases (0) another actor that is part of a possible cycle, then it should remove the cycle from its list of cycles and inform all members of the cycle set that the cycle is no longer valid.
-- Each "connection" that was part of a removed cycle probably needs to be "reset"
-- Each "connection" probably needs a epoch of some type. (tbd)
-- Each message probably needs to include the connection epoch (tbd)
+- When an actor GC releases another actor to rc 0, the CONNECTION to that actor is reset: all trace history and cycle state for that CONNECTION is cleared.
+- If the released actor is part of a known cycle, the actor removes the cycle from its set of known cycles and informs all members of the cycle set that the cycle is no longer valid.
+- CONNECTIONs that were part of a removed cycle are reset.
