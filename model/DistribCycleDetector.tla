@@ -230,14 +230,40 @@ DiscardStaleTrace(msg) ==
                     confirmedCycles, destroyed, pendingConfirmation>>
 
 \* A trace arrives at a non-originator actor already in the visited
-\* sequence. Pattern-2 cycle detection (extracting the sub-cycle) is
-\* not modeled, so the trace is discarded.
-DropStuckTrace(msg) ==
+\* sequence. Extract the sub-cycle (from the actor's position to the
+\* end) and record it as a candidate if per-hop epochs match.
+DetectSubCycle(msg) ==
     /\ msg \in messages
     /\ msg.type = TraceRouteMsg
     /\ Alive(msg.to)
     /\ msg.to \in VisitedIds(msg.visited)
     /\ msg.visited[1].id # msg.to
+    /\ LET pos == CHOOSE i \in 1..Len(msg.visited) : msg.visited[i].id = msg.to
+           subVisited == SubSeq(msg.visited, pos, Len(msg.visited))
+           members == VisitedIds(subVisited)
+       IN /\ \A i \in 1..Len(subVisited) :
+               subVisited[i].epoch = epoch[subVisited[i].id]
+          /\ ~\E c \in cycleCandidates :
+               c.members = members /\ c.detectedBy = msg.to
+          /\ cycleCandidates' = cycleCandidates \union {[
+                 members |-> members,
+                 detectedBy |-> msg.to]}
+    /\ messages' = messages \ {msg}
+    /\ UNCHANGED <<actors, epoch, inMem, confirmedCycles, destroyed,
+                    pendingConfirmation>>
+
+\* A trace arrives at a non-originator actor already in the visited
+\* sequence, but at least one per-hop epoch in the sub-cycle is stale.
+DiscardStaleSubCycle(msg) ==
+    /\ msg \in messages
+    /\ msg.type = TraceRouteMsg
+    /\ Alive(msg.to)
+    /\ msg.to \in VisitedIds(msg.visited)
+    /\ msg.visited[1].id # msg.to
+    /\ LET pos == CHOOSE i \in 1..Len(msg.visited) : msg.visited[i].id = msg.to
+           subVisited == SubSeq(msg.visited, pos, Len(msg.visited))
+       IN \E i \in 1..Len(subVisited) :
+           subVisited[i].epoch # epoch[subVisited[i].id]
     /\ messages' = messages \ {msg}
     /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
                     confirmedCycles, destroyed, pendingConfirmation>>
@@ -459,7 +485,8 @@ Next ==
     \/ \E m \in messages : ForwardTrace(m)
     \/ \E m \in messages : DetectCycle(m)
     \/ \E m \in messages : DiscardStaleTrace(m)
-    \/ \E m \in messages : DropStuckTrace(m)
+    \/ \E m \in messages : DetectSubCycle(m)
+    \/ \E m \in messages : DiscardStaleSubCycle(m)
     \/ \E c \in cycleCandidates : SendConfirmBlocked(c)
     \/ \E c \in cycleCandidates : DenyCandidate(c)
     \/ \E m \in messages : RespondConfirmed(m)

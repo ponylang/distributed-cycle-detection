@@ -6,7 +6,7 @@ TLA+ specification of the distributed cycle detection protocol. Uses TLC for exh
 
 - TRACE ROUTE propagation and forwarding with per-hop epoch checking
 - Epoch-based staleness detection (per-hop, not originator-only)
-- Cycle candidate detection
+- Cycle candidate detection (pattern-1 originator detection and pattern-2 sub-cycle extraction)
 - Multi-step confirmation (CONFIRM BLOCKED / CONFIRMED / DENIED exchange)
 - Cascading GC release (RELEASE messages, per-member reference drop, self-reap)
 - Self-reap (rc=0 actors)
@@ -14,7 +14,7 @@ TLA+ specification of the distributed cycle detection protocol. Uses TLC for exh
 
 ## Verified properties
 
-**DestructionSafety**: no alive actor holds a reference to a destroyed actor. Holds at scope 2 (unconstrained, 431K states) and scope 3 (state-constrained, 44.8M states).
+**DestructionSafety**: no alive actor holds a reference to a destroyed actor. Holds at scope 2 (unconstrained, 431K states) and scope 3 (state-constrained, 44.8M states, ~12 min).
 
 **NoOrphanMessages**: no in-flight message is addressed to a destroyed actor. Holds at same scopes.
 
@@ -27,7 +27,8 @@ TLA+ specification of the distributed cycle detection protocol. Uses TLC for exh
 3. Destruction must re-verify all confirmation conditions. An in-flight message from before confirmation can deliver a reference to a cycle member.
 4. Confirmation is robust to ACTOR IDENTIFIER reuse. Stale candidates from a previous incarnation either fail the topology/RC checks or describe a cycle that the new incarnation genuinely forms.
 5. Multi-step confirmation is safe under all interleavings. Between CONFIRM BLOCKED and a member's response, topology changes (new messages, reference drops, AppMessage deliveries) can occur. Members detect these via local checks and send DENIED. SendRelease re-verifies all conditions before initiating destruction.
-6. Cascading GC release is safe under all interleavings. The leader sends RELEASE to each member; each member drops references to other members and increments its epoch. Members whose rc reaches 0 self-reap via existing SelfReap guards. Partial release sequences — where some members have processed RELEASE but others haven't — cannot produce dangling references because SelfReap requires no alive actor to reference the actor, which blocks self-reap until all members who reference it have dropped their references.
+6. Pattern-2 sub-cycle detection is safe. When a non-originator actor finds itself in a trace's visited sequence, extracting the sub-cycle and recording it as a candidate feeds into the same confirmation and destruction pipeline as pattern-1 detection. DestructionSafety and NoOrphanMessages hold with the expanded candidate set. CandidateSoundness still fails for the same reason — post-detection topology changes.
+7. Cascading GC release is safe under all interleavings. The leader sends RELEASE to each member; each member drops references to other members and increments its epoch. Members whose rc reaches 0 self-reap via existing SelfReap guards. Partial release sequences — where some members have processed RELEASE but others haven't — cannot produce dangling references because SelfReap requires no alive actor to reference the actor, which blocks self-reap until all members who reference it have dropped their references.
 
 ## Running
 
@@ -55,13 +56,11 @@ docker run --rm -v $(pwd)/model:/model -w /model \
 
 | File | Scope | Invariants | Constraint | Purpose |
 |------|-------|------------|------------|---------|
-| `DistribCycleDetector.cfg` | 3 actors, 3 messages, MaxEpoch=1 | DestructionSafety, NoOrphanMessages | Yes | Main safety check (~10 min) |
-| `Scope2Safety.cfg` | 2 actors, 3 messages, MaxEpoch=2 | DestructionSafety, NoOrphanMessages | No | Unconstrained safety check (~5s) |
+| `DistribCycleDetector.cfg` | 3 actors, 3 messages, MaxEpoch=1 | DestructionSafety, NoOrphanMessages | Yes | Main safety check (~12 min) |
+| `Scope2Safety.cfg` | 2 actors, 3 messages, MaxEpoch=2 | DestructionSafety, NoOrphanMessages | No | Unconstrained safety check (~10s) |
 | `CandidateSoundness.cfg` | 2 actors, 3 messages, MaxEpoch=2 | CandidateSoundness | No | Reproduce false-candidate counterexample (<1s) |
 
 ## Modeling simplifications
-
-**Originator-only cycle detection.** The protocol spec describes two cycle discovery patterns: (1) the actor is the first entry — it originated the trace, and (2) the actor appears later — an actor outside the cycle originated the trace, and the cycle is the subset from the actor's entry to the end. The model only implements pattern 1. Pattern 2 would allow cycles to be detected by non-originators, catching cycles that happen to be subsets of a longer trace path.
 
 **Fixed-depth reachability.** `ReachableThroughSet` uses a 3-step BFS instead of recursive transitive closure. Correct for MaxActors ≤ 3.
 
