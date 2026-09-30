@@ -3,8 +3,9 @@
 (* TLA+ specification of the distributed cycle detection protocol for     *)
 (* Pony actors. Models trace propagation with per-hop epoch checking,     *)
 (* cycle candidate detection, multi-step confirmation via CONFIRM         *)
-(* BLOCKED / CONFIRMED / DENIED message exchange, cascading GC release    *)
-(* via RELEASE messages, self-reap, and CONNECTION reset with ACTOR       *)
+(* BLOCKED / CONFIRMED / DENIED message exchange, leadership delegation   *)
+(* via DELEGATE on confirmation failure, cascading GC release via         *)
+(* RELEASE messages, self-reap, and CONNECTION reset with ACTOR           *)
 (* IDENTIFIER reuse.                                                      *)
 (**************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets, TLC
@@ -35,6 +36,7 @@ ConfirmBlockedMsg == "ConfirmBlocked"
 ConfirmedMsg == "Confirmed"
 DeniedMsg == "Denied"
 ReleaseMsg == "Release"
+DelegateMsg == "Delegate"
 
 (**************************************************************************)
 (* Helper operators                                                       *)
@@ -65,7 +67,7 @@ IsRealCycle(members) ==
 
 \* Is a message a confirmation protocol message?
 IsConfirmationMsg(m) ==
-    m.type \in {ConfirmBlockedMsg, ConfirmedMsg, DeniedMsg}
+    m.type \in {ConfirmBlockedMsg, ConfirmedMsg, DeniedMsg, DelegateMsg}
 
 (**************************************************************************)
 (* Initial state                                                          *)
@@ -272,7 +274,8 @@ DiscardStaleSubCycle(msg) ==
 (* Multi-step confirmation                                                *)
 (* The leader sends CONFIRM BLOCKED to each member. Each member checks    *)
 (* local conditions and responds CONFIRMED or DENIED. The leader          *)
-(* collects responses and either confirms or abandons the candidate.      *)
+(* collects responses and either confirms the candidate, abandons it,     *)
+(* or delegates leadership to a denier via a DELEGATE message.            *)
 (**************************************************************************)
 
 \* The leader initiates confirmation by sending CONFIRM BLOCKED to
@@ -384,6 +387,57 @@ ConfirmationFailed(pending) ==
     /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
                     confirmedCycles, destroyed>>
 
+\* At least one member denied. The leader delegates leadership to one
+\* of the deniers by sending a DELEGATE message with the candidate
+\* updated to name the denier as the new leader. The leader consumes
+\* all response messages and removes the pending confirmation.
+DelegateLeadership(pending) ==
+    /\ pending \in pendingConfirmation
+    \* Every member has responded (confirmed or denied)
+    /\ \A m \in pending.members :
+        \E resp \in messages :
+            /\ resp.type \in {ConfirmedMsg, DeniedMsg}
+            /\ resp.to = pending.detectedBy
+            /\ resp.from = m
+            /\ resp.candidate = pending
+    \* At least one denied
+    /\ \E resp \in messages :
+        /\ resp.type = DeniedMsg
+        /\ resp.to = pending.detectedBy
+        /\ resp.candidate = pending
+    \* Pick one denier as the new leader
+    /\ \E denier \in pending.members :
+        /\ \E resp \in messages :
+            /\ resp.type = DeniedMsg
+            /\ resp.to = pending.detectedBy
+            /\ resp.from = denier
+            /\ resp.candidate = pending
+        /\ LET responses == {resp \in messages :
+                   /\ resp.type \in {ConfirmedMsg, DeniedMsg}
+                   /\ resp.to = pending.detectedBy
+                   /\ resp.candidate = pending}
+               newCandidate == [members |-> pending.members,
+                                detectedBy |-> denier]
+           IN /\ Cardinality(messages \ responses) < MaxMessages
+              /\ messages' = (messages \ responses) \union {[
+                     type |-> DelegateMsg,
+                     to |-> denier,
+                     candidate |-> newCandidate]}
+    /\ pendingConfirmation' = pendingConfirmation \ {pending}
+    /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
+                    confirmedCycles, destroyed>>
+
+\* The new leader receives a DELEGATE message and adds the candidate
+\* back to cycleCandidates for re-confirmation via SendConfirmBlocked.
+ReceiveDelegate(msg) ==
+    /\ msg \in messages
+    /\ msg.type = DelegateMsg
+    /\ Alive(msg.to)
+    /\ cycleCandidates' = cycleCandidates \union {msg.candidate}
+    /\ messages' = messages \ {msg}
+    /\ UNCHANGED <<actors, epoch, inMem, confirmedCycles,
+                    destroyed, pendingConfirmation>>
+
 \* Confirmation fails: at least one member can't reach itself.
 \* Garbage-collects stale candidates before they enter the confirmation
 \* pipeline and waste message capacity.
@@ -493,6 +547,8 @@ Next ==
     \/ \E m \in messages : RespondDenied(m)
     \/ \E p \in pendingConfirmation : ConfirmationSucceeded(p)
     \/ \E p \in pendingConfirmation : ConfirmationFailed(p)
+    \/ \E p \in pendingConfirmation : DelegateLeadership(p)
+    \/ \E m \in messages : ReceiveDelegate(m)
     \/ \E c \in confirmedCycles : SendRelease(c)
     \/ \E m \in messages : ProcessRelease(m)
     \/ \E a \in actors : SelfReap(a)
