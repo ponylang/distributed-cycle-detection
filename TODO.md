@@ -19,7 +19,7 @@
 - Model cascading GC release during destruction. Currently DestroyConfirmedCycle removes all members atomically. A more realistic model would mark members for destruction, release references one at a time, and let members self-reap as their rc reaches 0.
 - Model per-hop epoch checking. Traces currently carry a set of actor IDs, not an ordered list of (ACTOR IDENTIFIER, EPOCH) pairs. Adding per-hop epochs would make the model more faithful and potentially fix CandidateSoundness.
 - Model leadership determination and DELEGATE on DENIED. Currently the leader is fixed (detectedBy). In the protocol, leadership delegates to the first denier.
-- Test the model against a fully connected actor setup.
+- ~~Test the model against a fully connected actor setup.~~
 
 ## Implementation planning
 

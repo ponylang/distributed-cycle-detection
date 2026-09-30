@@ -89,6 +89,17 @@ Init ==
     /\ destroyed = {}
     /\ pendingConfirmation = {}
 
+\* All actors alive, each referencing every other
+InitFullyConnected ==
+    /\ actors = ActorIds
+    /\ epoch = [a \in ActorIds |-> 0]
+    /\ inMem = [a \in ActorIds |-> ActorIds \ {a}]
+    /\ messages = {}
+    /\ cycleCandidates = {}
+    /\ confirmedCycles = {}
+    /\ destroyed = {}
+    /\ pendingConfirmation = {}
+
 (**************************************************************************)
 (* Actions                                                                *)
 (**************************************************************************)
@@ -557,6 +568,8 @@ Next ==
     \/ \E a \in actors : SelfReap(a)
 
 Spec == Init /\ [][Next]_vars
+
+SpecFC == InitFullyConnected /\ [][Next]_vars
 
 (**************************************************************************)
 (* Invariants                                                             *)

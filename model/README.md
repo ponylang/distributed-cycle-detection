@@ -16,11 +16,11 @@ TLA+ specification of the distributed cycle detection protocol. Uses TLC for exh
 
 ## Verified properties
 
-**DestructionSafety**: no alive actor holds a reference to a destroyed actor. Holds at scope 2 (unconstrained, 481K states) and scope 3 (state-constrained, 43.5M states, ~12 min).
+**DestructionSafety**: no alive actor holds a reference to a destroyed actor. Holds at scope 2 (unconstrained, 481K states) and scope 3 (state-constrained, 43.5M states, ~13 min). Also holds under fully connected initial topology at scope 2 (481K states) and scope 3 (42.8M states, ~13 min).
 
-**NoOrphanMessages**: no in-flight message is addressed to a destroyed actor. Holds at same scopes.
+**NoOrphanMessages**: no in-flight message is addressed to a destroyed actor. Holds at same scopes, including fully connected initial topology.
 
-**LeadershipValidity**: the leader of every cycle candidate is a member of that candidate. Holds at scope 2.
+**LeadershipValidity**: the leader of every cycle candidate is a member of that candidate. Holds at scope 2, including fully connected initial topology.
 
 **CandidateSoundness**: every cycle candidate is a real cycle. Fails as expected — an actor can drop a reference after the candidate is recorded. Per-hop epoch checking prevents stale traces from producing candidates, but cannot prevent post-detection topology changes. The confirmation protocol catches these false candidates.
 
@@ -35,6 +35,7 @@ TLA+ specification of the distributed cycle detection protocol. Uses TLC for exh
 7. Cascading GC release is safe under all interleavings. The leader sends RELEASE to each member; each member drops references to other members and increments its epoch. Members whose rc reaches 0 self-reap via existing SelfReap guards. Partial release sequences — where some members have processed RELEASE but others haven't — cannot produce dangling references because SelfReap requires no alive actor to reference the actor, which blocks self-reap until all members who reference it have dropped their references.
 8. Leadership delegation on confirmation failure is safe. When the leader delegates to a denier via a DELEGATE message, the existing SelfReap guards prevent the denier from being destroyed while the DELEGATE is in flight — SelfReap requires that no message is addressed to the actor and that no confirmation protocol message references the actor in a candidate. The delegated candidate re-enters the confirmation pipeline through SendConfirmBlocked, where the same topology and RC checks apply. The model explores both delegation and abandonment on denial; safety holds under either strategy.
 9. Leadership determination by lowest actor identifier is safe and reduces the state space. When the detecting actor was always the leader, the same cycle detected by different members produced different candidates (different `detectedBy`). With deterministic leader selection, they produce the same candidate, so the existing set-union deduplicates them without additional mechanism. State space shrank ~8% at scope 2 (520K → 481K) and ~10% at scope 3 (48.2M → 43.5M).
+10. Safety holds under fully connected initial topologies. When all actors start alive and each references every other, cycles exist from the first state. DestructionSafety, NoOrphanMessages, and LeadershipValidity all hold. The fully connected topology produces slightly fewer distinct states at scope 3 (42.8M vs 43.5M) because SpawnActor is disabled when all IDs are in use. The protocol's safety does not depend on how topology forms — confirmation re-verifies all conditions regardless of initial state.
 
 ## Running
 
@@ -62,9 +63,11 @@ docker run --rm -v $(pwd)/model:/model -w /model \
 
 | File | Scope | Invariants | Constraint | Purpose |
 |------|-------|------------|------------|---------|
-| `DistribCycleDetector.cfg` | 3 actors, 3 messages, MaxEpoch=1 | DestructionSafety, NoOrphanMessages | Yes | Main safety check (~12 min) |
+| `DistribCycleDetector.cfg` | 3 actors, 3 messages, MaxEpoch=1 | DestructionSafety, NoOrphanMessages | Yes | Main safety check (~13 min) |
 | `Scope2Safety.cfg` | 2 actors, 3 messages, MaxEpoch=2 | DestructionSafety, NoOrphanMessages, LeadershipValidity | No | Unconstrained safety check (~6s) |
 | `CandidateSoundness.cfg` | 2 actors, 3 messages, MaxEpoch=2 | CandidateSoundness | No | Reproduce false-candidate counterexample (<1s) |
+| `FullyConnectedScope2.cfg` | 2 actors, 3 messages, MaxEpoch=2 | DestructionSafety, NoOrphanMessages, LeadershipValidity | No | Fully connected init, unconstrained (~6s) |
+| `FullyConnectedScope3.cfg` | 3 actors, 3 messages, MaxEpoch=1 | DestructionSafety, NoOrphanMessages | Yes | Fully connected init, state-constrained (~13 min) |
 
 ## Modeling simplifications
 
