@@ -4,8 +4,8 @@ TLA+ specification of the distributed cycle detection protocol. Uses TLC for exh
 
 ## What the model covers
 
-- TRACE ROUTE propagation and forwarding
-- Epoch-based staleness detection
+- TRACE ROUTE propagation and forwarding with per-hop epoch checking
+- Epoch-based staleness detection (per-hop, not originator-only)
 - Cycle candidate detection
 - Multi-step confirmation (CONFIRM BLOCKED / CONFIRMED / DENIED exchange)
 - Cascading GC release (RELEASE messages, per-member reference drop, self-reap)
@@ -14,15 +14,15 @@ TLA+ specification of the distributed cycle detection protocol. Uses TLC for exh
 
 ## Verified properties
 
-**DestructionSafety**: no alive actor holds a reference to a destroyed actor. Holds at scope 2 (unconstrained, 237K states) and scope 3 (state-constrained, 13.9M states).
+**DestructionSafety**: no alive actor holds a reference to a destroyed actor. Holds at scope 2 (unconstrained, 431K states) and scope 3 (state-constrained, 44.8M states).
 
 **NoOrphanMessages**: no in-flight message is addressed to a destroyed actor. Holds at same scopes.
 
-**CandidateSoundness**: every cycle candidate is a real cycle. Fails as expected — an intermediate actor can drop a reference after forwarding a trace. The confirmation protocol catches these false candidates.
+**CandidateSoundness**: every cycle candidate is a real cycle. Fails as expected — an actor can drop a reference after the candidate is recorded. Per-hop epoch checking prevents stale traces from producing candidates, but cannot prevent post-detection topology changes. The confirmation protocol catches these false candidates.
 
 ## Findings
 
-1. Originator-only epoch checking is insufficient for candidate soundness. Confirmation is required.
+1. Per-hop epoch checking eliminates false candidates from stale in-flight traces (where an intermediate actor's topology changed while the trace was in transit). CandidateSoundness still fails because topology can change after the candidate is recorded — this is inherent to any detection/confirmation split. Confirmation is required.
 2. SelfReap must check all in-flight message references, not just messages addressed to the actor.
 3. Destruction must re-verify all confirmation conditions. An in-flight message from before confirmation can deliver a reference to a cycle member.
 4. Confirmation is robust to ACTOR IDENTIFIER reuse. Stale candidates from a previous incarnation either fail the topology/RC checks or describe a cycle that the new incarnation genuinely forms.
@@ -55,13 +55,13 @@ docker run --rm -v $(pwd)/model:/model -w /model \
 
 | File | Scope | Invariants | Constraint | Purpose |
 |------|-------|------------|------------|---------|
-| `DistribCycleDetector.cfg` | 3 actors, 3 messages, MaxEpoch=1 | DestructionSafety, NoOrphanMessages | Yes | Main safety check (~3 min) |
-| `Scope2Safety.cfg` | 2 actors, 3 messages, MaxEpoch=2 | DestructionSafety, NoOrphanMessages | No | Unconstrained safety check (~4s) |
+| `DistribCycleDetector.cfg` | 3 actors, 3 messages, MaxEpoch=1 | DestructionSafety, NoOrphanMessages | Yes | Main safety check (~10 min) |
+| `Scope2Safety.cfg` | 2 actors, 3 messages, MaxEpoch=2 | DestructionSafety, NoOrphanMessages | No | Unconstrained safety check (~5s) |
 | `CandidateSoundness.cfg` | 2 actors, 3 messages, MaxEpoch=2 | CandidateSoundness | No | Reproduce false-candidate counterexample (<1s) |
 
 ## Modeling simplifications
 
-**Visited set, not ordered entries.** Traces carry a set of actor IDs instead of an ordered list of (ACTOR IDENTIFIER, EPOCH) pairs. Per-hop epoch checking is not modeled; only the originator's epoch is checked on return. This is the source of the CandidateSoundness violation.
+**Originator-only cycle detection.** The protocol spec describes two cycle discovery patterns: (1) the actor is the first entry — it originated the trace, and (2) the actor appears later — an actor outside the cycle originated the trace, and the cycle is the subset from the actor's entry to the end. The model only implements pattern 1. Pattern 2 would allow cycles to be detected by non-originators, catching cycles that happen to be subsets of a longer trace path.
 
 **Fixed-depth reachability.** `ReachableThroughSet` uses a 3-step BFS instead of recursive transitive closure. Correct for MaxActors ≤ 3.
 

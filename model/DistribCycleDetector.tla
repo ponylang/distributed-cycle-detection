@@ -1,10 +1,11 @@
 --------------------------- MODULE DistribCycleDetector ---------------------------
 (**************************************************************************)
 (* TLA+ specification of the distributed cycle detection protocol for     *)
-(* Pony actors. Models trace propagation, epoch-based staleness, cycle    *)
-(* candidate detection, multi-step confirmation via CONFIRM BLOCKED /     *)
-(* CONFIRMED / DENIED message exchange, cascading GC release via RELEASE  *)
-(* messages, self-reap, and CONNECTION reset with ACTOR IDENTIFIER reuse. *)
+(* Pony actors. Models trace propagation with per-hop epoch checking,     *)
+(* cycle candidate detection, multi-step confirmation via CONFIRM         *)
+(* BLOCKED / CONFIRMED / DENIED message exchange, cascading GC release    *)
+(* via RELEASE messages, self-reap, and CONNECTION reset with ACTOR       *)
+(* IDENTIFIER reuse.                                                      *)
 (**************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets, TLC
 
@@ -41,6 +42,8 @@ ReleaseMsg == "Release"
 
 \* An actor is alive if it's in actors and not destroyed
 Alive(a) == a \in actors /\ a \notin destroyed
+
+VisitedIds(visited) == {visited[i].id : i \in 1..Len(visited)}
 
 \* Messages enqueued to a specific actor
 MessagesTo(a) == {m \in messages : m.to = a}
@@ -119,7 +122,7 @@ ReuseActorId(spawner) ==
 \* CONNECTION reset: when the last reference to another actor is dropped,
 \* all trace history and cycle state for that connection is cleared.
 \* In the model, this is captured by the epoch increment — stale traces
-\* from before the drop are discarded when they return to the originator.
+\* from before the drop are caught by per-hop epoch checking.
 \*
 \* Epoch saturation: when epoch reaches MaxEpoch, further drops don't
 \* increment it. A stale trace from after saturation carries the same
@@ -171,38 +174,39 @@ InitiateTrace(initiator) ==
         /\ messages' = messages \union {[
                type |-> TraceRouteMsg,
                to |-> target,
-               visited |-> {initiator},
-               originator |-> initiator,
-               originatorEpoch |-> epoch[initiator]]}
+               visited |-> <<[id |-> initiator,
+                              epoch |-> epoch[initiator]]>>]}
         /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
                         confirmedCycles, destroyed, pendingConfirmation>>
 
-\* An actor receives a trace whose originator is NOT itself; forwards it
+\* An unvisited actor receives a trace and forwards it
 ForwardTrace(msg) ==
     /\ msg \in messages
     /\ msg.type = TraceRouteMsg
     /\ Alive(msg.to)
-    /\ msg.originator # msg.to
+    /\ msg.to \notin VisitedIds(msg.visited)
     /\ inMem[msg.to] # {}
     /\ Cardinality(messages) < MaxMessages
     /\ \E target \in inMem[msg.to] :
         /\ messages' = (messages \ {msg}) \union {[
                type |-> TraceRouteMsg,
                to |-> target,
-               visited |-> msg.visited \union {msg.to},
-               originator |-> msg.originator,
-               originatorEpoch |-> msg.originatorEpoch]}
+               visited |-> Append(msg.visited,
+                                  [id |-> msg.to,
+                                   epoch |-> epoch[msg.to]])]}
         /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
                         confirmedCycles, destroyed, pendingConfirmation>>
 
-\* An actor receives a trace whose originator IS itself, epoch matches
+\* An actor receives a trace whose originator IS itself and all
+\* per-hop epochs match their actors' current epochs.
 DetectCycle(msg) ==
     /\ msg \in messages
     /\ msg.type = TraceRouteMsg
     /\ Alive(msg.to)
-    /\ msg.originator = msg.to
-    /\ msg.originatorEpoch = epoch[msg.to]
-    /\ LET members == msg.visited
+    /\ msg.visited[1].id = msg.to
+    /\ \A i \in 1..Len(msg.visited) :
+        msg.visited[i].epoch = epoch[msg.visited[i].id]
+    /\ LET members == VisitedIds(msg.visited)
        IN /\ ~\E c \in cycleCandidates :
                c.members = members /\ c.detectedBy = msg.to
           /\ cycleCandidates' = cycleCandidates \union {[
@@ -212,13 +216,28 @@ DetectCycle(msg) ==
     /\ UNCHANGED <<actors, epoch, inMem, confirmedCycles, destroyed,
                     pendingConfirmation>>
 
-\* An actor receives a trace whose originator IS itself, epoch mismatch
+\* An actor receives a trace whose originator IS itself but at least
+\* one per-hop epoch does not match its actor's current epoch.
 DiscardStaleTrace(msg) ==
     /\ msg \in messages
     /\ msg.type = TraceRouteMsg
     /\ Alive(msg.to)
-    /\ msg.originator = msg.to
-    /\ msg.originatorEpoch # epoch[msg.to]
+    /\ msg.visited[1].id = msg.to
+    /\ \E i \in 1..Len(msg.visited) :
+        msg.visited[i].epoch # epoch[msg.visited[i].id]
+    /\ messages' = messages \ {msg}
+    /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
+                    confirmedCycles, destroyed, pendingConfirmation>>
+
+\* A trace arrives at a non-originator actor already in the visited
+\* sequence. Pattern-2 cycle detection (extracting the sub-cycle) is
+\* not modeled, so the trace is discarded.
+DropStuckTrace(msg) ==
+    /\ msg \in messages
+    /\ msg.type = TraceRouteMsg
+    /\ Alive(msg.to)
+    /\ msg.to \in VisitedIds(msg.visited)
+    /\ msg.visited[1].id # msg.to
     /\ messages' = messages \ {msg}
     /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
                     confirmedCycles, destroyed, pendingConfirmation>>
@@ -371,7 +390,7 @@ SendRelease(confirmed) ==
     /\ \A a \in confirmed.members :
         ~\E m \in messages :
             \/ (m.type = AppMsg /\ a \in m.args)
-            \/ (m.type = TraceRouteMsg /\ a \in m.visited)
+            \/ (m.type = TraceRouteMsg /\ a \in VisitedIds(m.visited))
     \* No messages queued for any member
     /\ \A a \in confirmed.members :
         MessagesTo(a) = {}
@@ -409,7 +428,7 @@ SelfReap(actor) ==
     /\ ~\E m \in messages :
         \/ m.to = actor
         \/ (m.type = AppMsg /\ actor \in m.args)
-        \/ (m.type = TraceRouteMsg /\ actor \in m.visited)
+        \/ (m.type = TraceRouteMsg /\ actor \in VisitedIds(m.visited))
     \* Not involved in any pending confirmation
     /\ ~\E p \in pendingConfirmation : actor \in p.members
     \* No protocol message references this actor in a candidate
@@ -440,6 +459,7 @@ Next ==
     \/ \E m \in messages : ForwardTrace(m)
     \/ \E m \in messages : DetectCycle(m)
     \/ \E m \in messages : DiscardStaleTrace(m)
+    \/ \E m \in messages : DropStuckTrace(m)
     \/ \E c \in cycleCandidates : SendConfirmBlocked(c)
     \/ \E c \in cycleCandidates : DenyCandidate(c)
     \/ \E m \in messages : RespondConfirmed(m)
@@ -457,8 +477,10 @@ Spec == Init /\ [][Next]_vars
 (**************************************************************************)
 
 \* CANDIDATE SOUNDNESS: every cycle candidate is a real cycle.
-\* Expected to FAIL — an intermediate actor can drop a reference after
-\* forwarding a trace.
+\* Expected to FAIL — an actor can drop a reference after the candidate
+\* is recorded. Per-hop epoch checking prevents stale traces from
+\* producing candidates, but cannot prevent post-detection topology
+\* changes. The confirmation protocol catches these.
 CandidateSoundness ==
     \A c \in cycleCandidates : IsRealCycle(c.members)
 
