@@ -5,6 +5,7 @@ TLA+ specification of the distributed cycle detection protocol. Uses TLC for exh
 ## What the model covers
 
 - TRACE ROUTE propagation and forwarding with per-hop epoch checking
+- CONNECTION-level trace deduplication (suppresses duplicate chains per connection)
 - Epoch-based staleness detection (per-hop, not originator-only)
 - Cycle candidate detection (pattern-1 originator detection and pattern-2 sub-cycle extraction)
 - Leadership determination (lowest actor identifier tiebreaker)
@@ -16,7 +17,7 @@ TLA+ specification of the distributed cycle detection protocol. Uses TLC for exh
 
 ## Verified properties
 
-**DestructionSafety**: no alive actor holds a reference to a destroyed actor. Holds at scope 2 (unconstrained, 481K states) and scope 3 (state-constrained, 43.5M states, ~13 min). Also holds under fully connected initial topology at scope 2 (481K states) and scope 3 (42.8M states, ~13 min).
+**DestructionSafety**: no alive actor holds a reference to a destroyed actor. Holds at scope 2 (unconstrained, 2.9M states) and scope 3 (state-constrained, 18.1M states, ~6 min). Also holds under fully connected initial topology at scope 2 (2.9M states) and scope 3 (17.5M states, ~6 min).
 
 **NoOrphanMessages**: no in-flight message is addressed to a destroyed actor. Holds at same scopes, including fully connected initial topology.
 
@@ -35,7 +36,8 @@ TLA+ specification of the distributed cycle detection protocol. Uses TLC for exh
 7. Cascading GC release is safe under all interleavings. The leader sends RELEASE to each member; each member drops references to other members and increments its epoch. Members whose rc reaches 0 self-reap via existing SelfReap guards. Partial release sequences — where some members have processed RELEASE but others haven't — cannot produce dangling references because SelfReap requires no alive actor to reference the actor, which blocks self-reap until all members who reference it have dropped their references.
 8. Leadership delegation on confirmation failure is safe. When the leader delegates to a denier via a DELEGATE message, the existing SelfReap guards prevent the denier from being destroyed while the DELEGATE is in flight — SelfReap requires that no message is addressed to the actor and that no confirmation protocol message references the actor in a candidate. The delegated candidate re-enters the confirmation pipeline through SendConfirmBlocked, where the same topology and RC checks apply. The model explores both delegation and abandonment on denial; safety holds under either strategy.
 9. Leadership determination by lowest actor identifier is safe and reduces the state space. When the detecting actor was always the leader, the same cycle detected by different members produced different candidates (different `detectedBy`). With deterministic leader selection, they produce the same candidate, so the existing set-union deduplicates them without additional mechanism. State space shrank ~8% at scope 2 (520K → 481K) and ~10% at scope 3 (48.2M → 43.5M).
-10. Safety holds under fully connected initial topologies. When all actors start alive and each references every other, cycles exist from the first state. DestructionSafety, NoOrphanMessages, and LeadershipValidity all hold. The fully connected topology produces slightly fewer distinct states at scope 3 (42.8M vs 43.5M) because SpawnActor is disabled when all IDs are in use. The protocol's safety does not depend on how topology forms — confirmation re-verifies all conditions regardless of initial state.
+10. Safety holds under fully connected initial topologies. When all actors start alive and each references every other, cycles exist from the first state. DestructionSafety, NoOrphanMessages, and LeadershipValidity all hold. The fully connected topology produces slightly fewer distinct states at scope 3 (17.5M vs 18.1M) because SpawnActor is disabled when all IDs are in use. The protocol's safety does not depend on how topology forms — confirmation re-verifies all conditions regardless of initial state.
+11. CONNECTION-level trace deduplication is safe. Suppressing duplicate trace chains per connection does not break DestructionSafety or NoOrphanMessages. The `sentTraces` state tracks which `[from, to, chain]` tuples have been sent; ForwardTrace and InitiateTrace check and record entries; SuppressDuplicateTrace consumes traces when all outgoing connections have already seen the chain. CONNECTION reset (ReduceMem, ProcessRelease) clears deduplication entries for dropped connections, preventing stale history from suppressing traces after topology changes. SelfReap clears all entries involving the destroyed actor. At scope 3, the state space shrank ~58% (43.5M → 18.1M) because deduplication suppresses enough redundant trace messages to more than offset the added state variable. At scope 2 unconstrained, the state space grew ~6x (481K → 2.9M) because sentTraces accumulates without a constraint bound.
 
 ## Running
 
@@ -63,17 +65,17 @@ docker run --rm -v $(pwd)/model:/model -w /model \
 
 | File | Scope | Invariants | Constraint | Purpose |
 |------|-------|------------|------------|---------|
-| `DistribCycleDetector.cfg` | 3 actors, 3 messages, MaxEpoch=1 | DestructionSafety, NoOrphanMessages | Yes | Main safety check (~13 min) |
-| `Scope2Safety.cfg` | 2 actors, 3 messages, MaxEpoch=2 | DestructionSafety, NoOrphanMessages, LeadershipValidity | No | Unconstrained safety check (~6s) |
+| `DistribCycleDetector.cfg` | 3 actors, 3 messages, MaxEpoch=1 | DestructionSafety, NoOrphanMessages | Yes | Main safety check (~6 min) |
+| `Scope2Safety.cfg` | 2 actors, 3 messages, MaxEpoch=2 | DestructionSafety, NoOrphanMessages, LeadershipValidity | No | Unconstrained safety check (~1 min) |
 | `CandidateSoundness.cfg` | 2 actors, 3 messages, MaxEpoch=2 | CandidateSoundness | No | Reproduce false-candidate counterexample (<1s) |
-| `FullyConnectedScope2.cfg` | 2 actors, 3 messages, MaxEpoch=2 | DestructionSafety, NoOrphanMessages, LeadershipValidity | No | Fully connected init, unconstrained (~6s) |
-| `FullyConnectedScope3.cfg` | 3 actors, 3 messages, MaxEpoch=1 | DestructionSafety, NoOrphanMessages | Yes | Fully connected init, state-constrained (~13 min) |
+| `FullyConnectedScope2.cfg` | 2 actors, 3 messages, MaxEpoch=2 | DestructionSafety, NoOrphanMessages, LeadershipValidity | No | Fully connected init, unconstrained (~1 min) |
+| `FullyConnectedScope3.cfg` | 3 actors, 3 messages, MaxEpoch=1 | DestructionSafety, NoOrphanMessages | Yes | Fully connected init, state-constrained (~6 min) |
 
 ## Modeling simplifications
 
 **Fixed-depth reachability.** `ReachableThroughSet` uses a 3-step BFS instead of recursive transitive closure. Correct for MaxActors ≤ 3.
 
-**State constraint at scope 3.** Bounds the sum of actors + messages + candidates + confirmed + destroyed + pendingConfirmation to MaxActors + MaxMessages (= 6 at scope 3). Multi-step confirmation for a 3-member cycle is unreachable under this constraint: SendConfirmBlocked sends 3 messages and adds 1 pendingConfirmation, producing a state sum of at least 7. Similarly, SendRelease for a 3-member cycle sends 3 RELEASE messages, which also requires sum headroom. Only 2-member cycles can enter multi-step confirmation and cascading release at scope 3 (sum = 6, at the bound). Scope 2 unconstrained has no such limitation and exercises the full protocol for 2-member cycles.
+**State constraint at scope 3.** Bounds the sum of actors + messages + candidates + confirmed + destroyed + pendingConfirmation + sentTraces to MaxActors + MaxMessages (= 6 at scope 3). Multi-step confirmation for a 3-member cycle is unreachable under this constraint: SendConfirmBlocked sends 3 messages and adds 1 pendingConfirmation, producing a state sum of at least 7. Similarly, SendRelease for a 3-member cycle sends 3 RELEASE messages, which also requires sum headroom. Only 2-member cycles can enter multi-step confirmation and cascading release at scope 3 (sum = 6, at the bound). Scope 2 unconstrained has no such limitation and exercises the full protocol for 2-member cycles.
 
 **No explicit RC counter.** The model has no ORCA runtime maintaining reference counts. Instead, member confirmation checks simulate ORCA's rc accounting by explicitly checking inMem (no external references) and in-flight AppMsg args (no references in transit). This is more conservative than the real protocol's single rc comparison but covers the same ground.
 
@@ -84,5 +86,3 @@ docker run --rm -v $(pwd)/model:/model -w /model \
 **Leader waits for all responses before acting on denial.** `ConfirmationFailed` and `DelegateLeadership` require every member to have responded (CONFIRMED or DENIED) before the leader acts. The real protocol could act on the first DENIED. Waiting longer is conservative — more time for topology changes makes confirmation harder, not easier.
 
 **Implicit destruction tracking.** The model has no `pendingDestruction` variable. When SendRelease sends RELEASE messages and removes the confirmed cycle from `confirmedCycles`, the pending RELEASE messages in the message set are the only record that destruction is in progress. SelfReap's existing guards — no alive actor references the actor, no messages addressed to it — prevent member self-reap until all references are dropped. This avoids adding a state variable dimension.
-
-**No deduplication.** CONNECTION-level trace deduplication is not modeled. Leadership determination and leadership delegation on confirmation failure are both modeled — the initial leader is chosen by appearance count (always a tie in the model's simple cycles) with lowest actor identifier as tiebreaker, and when confirmation fails, the leader can delegate to a denier via a DELEGATE message.
