@@ -2,11 +2,11 @@
 (**************************************************************************)
 (* TLA+ specification of the distributed cycle detection protocol for     *)
 (* Pony actors. Models trace propagation with per-hop epoch checking,     *)
-(* cycle candidate detection, multi-step confirmation via CONFIRM         *)
-(* BLOCKED / CONFIRMED / DENIED message exchange, leadership delegation   *)
-(* via DELEGATE on confirmation failure, cascading GC release via         *)
-(* RELEASE messages, self-reap, and CONNECTION reset with ACTOR           *)
-(* IDENTIFIER reuse.                                                      *)
+(* cycle candidate detection, leadership determination (lowest actor      *)
+(* identifier tiebreaker), multi-step confirmation via CONFIRM BLOCKED /  *)
+(* CONFIRMED / DENIED message exchange, leadership delegation via         *)
+(* DELEGATE on confirmation failure, cascading GC release via RELEASE     *)
+(* messages, self-reap, and CONNECTION reset with ACTOR IDENTIFIER reuse. *)
 (**************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets, TLC
 
@@ -64,6 +64,11 @@ ReachableThroughSet(a, S) ==
 IsRealCycle(members) ==
     /\ members # {}
     /\ \A a \in members : ReachableThroughSet(a, members)
+
+\* The leader of a member set: the member with the lowest actor identifier.
+\* In the model, each actor appears once per cycle, so "most appearances"
+\* is always a tie and the tiebreaker (lowest ID) is decisive.
+Leader(members) == CHOOSE a \in members : \A b \in members : a <= b
 
 \* Is a message a confirmation protocol message?
 IsConfirmationMsg(m) ==
@@ -209,11 +214,10 @@ DetectCycle(msg) ==
     /\ \A i \in 1..Len(msg.visited) :
         msg.visited[i].epoch = epoch[msg.visited[i].id]
     /\ LET members == VisitedIds(msg.visited)
-       IN /\ ~\E c \in cycleCandidates :
-               c.members = members /\ c.detectedBy = msg.to
+       IN /\ ~\E c \in cycleCandidates : c.members = members
           /\ cycleCandidates' = cycleCandidates \union {[
                  members |-> members,
-                 detectedBy |-> msg.to]}
+                 detectedBy |-> Leader(members)]}
     /\ messages' = messages \ {msg}
     /\ UNCHANGED <<actors, epoch, inMem, confirmedCycles, destroyed,
                     pendingConfirmation>>
@@ -245,11 +249,10 @@ DetectSubCycle(msg) ==
            members == VisitedIds(subVisited)
        IN /\ \A i \in 1..Len(subVisited) :
                subVisited[i].epoch = epoch[subVisited[i].id]
-          /\ ~\E c \in cycleCandidates :
-               c.members = members /\ c.detectedBy = msg.to
+          /\ ~\E c \in cycleCandidates : c.members = members
           /\ cycleCandidates' = cycleCandidates \union {[
                  members |-> members,
-                 detectedBy |-> msg.to]}
+                 detectedBy |-> Leader(members)]}
     /\ messages' = messages \ {msg}
     /\ UNCHANGED <<actors, epoch, inMem, confirmedCycles, destroyed,
                     pendingConfirmation>>
@@ -575,6 +578,10 @@ DestructionSafety ==
 \* NO ORPHAN MESSAGES: no message is addressed to a destroyed actor.
 NoOrphanMessages ==
     \A m \in messages : m.to \notin destroyed
+
+\* LEADERSHIP VALIDITY: the leader of every cycle candidate is a member.
+LeadershipValidity ==
+    \A c \in cycleCandidates : c.detectedBy \in c.members
 
 \* STATE CONSTRAINT: bounds total state complexity for tractable checking.
 \* Confirmation protocol messages and pendingConfirmation records count

@@ -7,6 +7,7 @@ TLA+ specification of the distributed cycle detection protocol. Uses TLC for exh
 - TRACE ROUTE propagation and forwarding with per-hop epoch checking
 - Epoch-based staleness detection (per-hop, not originator-only)
 - Cycle candidate detection (pattern-1 originator detection and pattern-2 sub-cycle extraction)
+- Leadership determination (lowest actor identifier tiebreaker)
 - Multi-step confirmation (CONFIRM BLOCKED / CONFIRMED / DENIED exchange)
 - Leadership delegation via DELEGATE on confirmation failure
 - Cascading GC release (RELEASE messages, per-member reference drop, self-reap)
@@ -15,9 +16,11 @@ TLA+ specification of the distributed cycle detection protocol. Uses TLC for exh
 
 ## Verified properties
 
-**DestructionSafety**: no alive actor holds a reference to a destroyed actor. Holds at scope 2 (unconstrained, 520K states) and scope 3 (state-constrained, 48.2M states, ~11 min).
+**DestructionSafety**: no alive actor holds a reference to a destroyed actor. Holds at scope 2 (unconstrained, 481K states) and scope 3 (state-constrained, 43.5M states, ~12 min).
 
 **NoOrphanMessages**: no in-flight message is addressed to a destroyed actor. Holds at same scopes.
+
+**LeadershipValidity**: the leader of every cycle candidate is a member of that candidate. Holds at scope 2.
 
 **CandidateSoundness**: every cycle candidate is a real cycle. Fails as expected — an actor can drop a reference after the candidate is recorded. Per-hop epoch checking prevents stale traces from producing candidates, but cannot prevent post-detection topology changes. The confirmation protocol catches these false candidates.
 
@@ -31,6 +34,7 @@ TLA+ specification of the distributed cycle detection protocol. Uses TLC for exh
 6. Pattern-2 sub-cycle detection is safe. When a non-originator actor finds itself in a trace's visited sequence, extracting the sub-cycle and recording it as a candidate feeds into the same confirmation and destruction pipeline as pattern-1 detection. DestructionSafety and NoOrphanMessages hold with the expanded candidate set. CandidateSoundness still fails for the same reason — post-detection topology changes.
 7. Cascading GC release is safe under all interleavings. The leader sends RELEASE to each member; each member drops references to other members and increments its epoch. Members whose rc reaches 0 self-reap via existing SelfReap guards. Partial release sequences — where some members have processed RELEASE but others haven't — cannot produce dangling references because SelfReap requires no alive actor to reference the actor, which blocks self-reap until all members who reference it have dropped their references.
 8. Leadership delegation on confirmation failure is safe. When the leader delegates to a denier via a DELEGATE message, the existing SelfReap guards prevent the denier from being destroyed while the DELEGATE is in flight — SelfReap requires that no message is addressed to the actor and that no confirmation protocol message references the actor in a candidate. The delegated candidate re-enters the confirmation pipeline through SendConfirmBlocked, where the same topology and RC checks apply. The model explores both delegation and abandonment on denial; safety holds under either strategy.
+9. Leadership determination by lowest actor identifier is safe and reduces the state space. When the detecting actor was always the leader, the same cycle detected by different members produced different candidates (different `detectedBy`). With deterministic leader selection, they produce the same candidate, so the existing set-union deduplicates them without additional mechanism. State space shrank ~8% at scope 2 (520K → 481K) and ~10% at scope 3 (48.2M → 43.5M).
 
 ## Running
 
@@ -58,8 +62,8 @@ docker run --rm -v $(pwd)/model:/model -w /model \
 
 | File | Scope | Invariants | Constraint | Purpose |
 |------|-------|------------|------------|---------|
-| `DistribCycleDetector.cfg` | 3 actors, 3 messages, MaxEpoch=1 | DestructionSafety, NoOrphanMessages | Yes | Main safety check (~11 min) |
-| `Scope2Safety.cfg` | 2 actors, 3 messages, MaxEpoch=2 | DestructionSafety, NoOrphanMessages | No | Unconstrained safety check (~6s) |
+| `DistribCycleDetector.cfg` | 3 actors, 3 messages, MaxEpoch=1 | DestructionSafety, NoOrphanMessages | Yes | Main safety check (~12 min) |
+| `Scope2Safety.cfg` | 2 actors, 3 messages, MaxEpoch=2 | DestructionSafety, NoOrphanMessages, LeadershipValidity | No | Unconstrained safety check (~6s) |
 | `CandidateSoundness.cfg` | 2 actors, 3 messages, MaxEpoch=2 | CandidateSoundness | No | Reproduce false-candidate counterexample (<1s) |
 
 ## Modeling simplifications
@@ -78,4 +82,4 @@ docker run --rm -v $(pwd)/model:/model -w /model \
 
 **Implicit destruction tracking.** The model has no `pendingDestruction` variable. When SendRelease sends RELEASE messages and removes the confirmed cycle from `confirmedCycles`, the pending RELEASE messages in the message set are the only record that destruction is in progress. SelfReap's existing guards — no alive actor references the actor, no messages addressed to it — prevent member self-reap until all references are dropped. This avoids adding a state variable dimension.
 
-**No leadership determination or deduplication.** Leadership determination (which actor becomes leader based on appearance count) and CONNECTION-level trace deduplication are not modeled. Leadership delegation on confirmation failure is modeled — when confirmation fails, the leader can delegate to a denier via a DELEGATE message, and the new leader re-enters the confirmation pipeline.
+**No deduplication.** CONNECTION-level trace deduplication is not modeled. Leadership determination and leadership delegation on confirmation failure are both modeled — the initial leader is chosen by appearance count (always a tie in the model's simple cycles) with lowest actor identifier as tiebreaker, and when confirmation fails, the leader can delegate to a denier via a DELEGATE message.
