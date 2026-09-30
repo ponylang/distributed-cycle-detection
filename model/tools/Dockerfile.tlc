@@ -1,0 +1,7 @@
+FROM eclipse-temurin:17-jdk-jammy
+
+WORKDIR /tlaplus
+
+COPY tla2tools.jar /tlaplus/tla2tools.jar
+
+ENTRYPOINT ["java", "-jar", "/tlaplus/tla2tools.jar"]
