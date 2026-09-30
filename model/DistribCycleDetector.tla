@@ -3,8 +3,8 @@
 (* TLA+ specification of the distributed cycle detection protocol for     *)
 (* Pony actors. Models trace propagation, epoch-based staleness, cycle    *)
 (* candidate detection, multi-step confirmation via CONFIRM BLOCKED /     *)
-(* CONFIRMED / DENIED message exchange, destruction, self-reap, and       *)
-(* CONNECTION reset with ACTOR IDENTIFIER reuse.                          *)
+(* CONFIRMED / DENIED message exchange, cascading GC release via RELEASE  *)
+(* messages, self-reap, and CONNECTION reset with ACTOR IDENTIFIER reuse. *)
 (**************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets, TLC
 
@@ -33,6 +33,7 @@ AppMsg == "App"
 ConfirmBlockedMsg == "ConfirmBlocked"
 ConfirmedMsg == "Confirmed"
 DeniedMsg == "Denied"
+ReleaseMsg == "Release"
 
 (**************************************************************************)
 (* Helper operators                                                       *)
@@ -60,7 +61,7 @@ IsRealCycle(members) ==
     /\ \A a \in members : ReachableThroughSet(a, members)
 
 \* Is a message a confirmation protocol message?
-IsProtocolMsg(m) ==
+IsConfirmationMsg(m) ==
     m.type \in {ConfirmBlockedMsg, ConfirmedMsg, DeniedMsg}
 
 (**************************************************************************)
@@ -348,9 +349,17 @@ DenyCandidate(candidate) ==
     /\ UNCHANGED <<actors, epoch, inMem, messages,
                     confirmedCycles, destroyed, pendingConfirmation>>
 
-\* Destroy a confirmed cycle: remove all members.
-\* Re-checks all confirmation conditions.
-DestroyConfirmedCycle(confirmed) ==
+(**************************************************************************)
+(* Cascading GC release                                                   *)
+(* The leader sends RELEASE to each cycle member. Each member drops its   *)
+(* references to other members. Members whose rc reaches 0 self-reap via  *)
+(* the existing SelfReap action.                                          *)
+(**************************************************************************)
+
+\* The leader initiates destruction by sending RELEASE to each cycle
+\* member (including itself — uniform processing). Re-verifies all
+\* confirmation conditions before proceeding.
+SendRelease(confirmed) ==
     /\ confirmed \in confirmedCycles
     /\ \A a \in confirmed.members : Alive(a)
     /\ IsRealCycle(confirmed.members)
@@ -366,27 +375,29 @@ DestroyConfirmedCycle(confirmed) ==
     \* No messages queued for any member
     /\ \A a \in confirmed.members :
         MessagesTo(a) = {}
-    /\ destroyed' = destroyed \union confirmed.members
+    /\ Cardinality(messages) + Cardinality(confirmed.members) <= MaxMessages
+    /\ messages' = messages \union
+           {[type |-> ReleaseMsg,
+             to |-> m,
+             confirmed |-> confirmed] : m \in confirmed.members}
     /\ confirmedCycles' = confirmedCycles \ {confirmed}
-    /\ inMem' = [a \in ActorIds |->
-                    IF a \in confirmed.members
-                    THEN {}
-                    ELSE inMem[a] \ confirmed.members]
-    \* Remove messages to/from destroyed actors, including protocol
-    \* messages whose candidate involves a destroyed member
-    /\ messages' = {m \in messages :
-                       /\ m.to \notin confirmed.members
-                       /\ (m.type = TraceRouteMsg =>
-                           m.originator \notin confirmed.members)
-                       /\ (IsProtocolMsg(m) =>
-                           m.candidate.members \cap confirmed.members = {})}
-    \* Remove candidates involving destroyed actors
-    /\ cycleCandidates' = {c \in cycleCandidates :
-                              c.members \cap confirmed.members = {}}
-    \* Remove pending confirmations involving destroyed actors
-    /\ pendingConfirmation' = {p \in pendingConfirmation :
-                                  p.members \cap confirmed.members = {}}
-    /\ UNCHANGED <<actors, epoch>>
+    /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
+                    destroyed, pendingConfirmation>>
+
+\* A member receives RELEASE and drops its references to other cycle
+\* members. Increments epoch to invalidate stale traces.
+ProcessRelease(msg) ==
+    /\ msg \in messages
+    /\ msg.type = ReleaseMsg
+    /\ Alive(msg.to)
+    /\ LET others == msg.confirmed.members \ {msg.to}
+       IN /\ inMem' = [inMem EXCEPT ![msg.to] = @ \ others]
+          /\ epoch' = [epoch EXCEPT ![msg.to] = IF @ < MaxEpoch
+                                                 THEN @ + 1
+                                                 ELSE @]
+    /\ messages' = messages \ {msg}
+    /\ UNCHANGED <<actors, cycleCandidates, confirmedCycles,
+                    destroyed, pendingConfirmation>>
 
 \* Self-reap: an actor with rc=0 and no messages in its queue.
 SelfReap(actor) ==
@@ -403,7 +414,7 @@ SelfReap(actor) ==
     /\ ~\E p \in pendingConfirmation : actor \in p.members
     \* No protocol message references this actor in a candidate
     /\ ~\E m \in messages :
-        IsProtocolMsg(m) /\ actor \in m.candidate.members
+        IsConfirmationMsg(m) /\ actor \in m.candidate.members
     /\ destroyed' = destroyed \union {actor}
     /\ inMem' = [inMem EXCEPT ![actor] = {}]
     \* Remove candidates involving this actor
@@ -435,7 +446,8 @@ Next ==
     \/ \E m \in messages : RespondDenied(m)
     \/ \E p \in pendingConfirmation : ConfirmationSucceeded(p)
     \/ \E p \in pendingConfirmation : ConfirmationFailed(p)
-    \/ \E c \in confirmedCycles : DestroyConfirmedCycle(c)
+    \/ \E c \in confirmedCycles : SendRelease(c)
+    \/ \E m \in messages : ProcessRelease(m)
     \/ \E a \in actors : SelfReap(a)
 
 Spec == Init /\ [][Next]_vars
