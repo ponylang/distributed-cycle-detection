@@ -35,43 +35,19 @@ These are recorded in protocol.md. Summary:
 
 - **TODO.md**: Open design questions, formal modeling needs, implementation planning.
 
-- **Alloy model** (model/): Covers basic actor/message/connection structure and state changes (spawn, reduce memory, send/receive app messages). Does NOT yet model the distributed cycle detection protocol — no TRACE ROUTE handling, no cycle detection logic, no confirmation, no destruction, no epochs, no CONNECTION reset.
+- **TLA+ model** (model/): Covers trace propagation, epoch-based staleness detection, cycle candidate detection, multi-step confirmation (CONFIRM BLOCKED / CONFIRMED / DENIED exchange), destruction with re-verification, self-reap, and ACTOR IDENTIFIER reuse. Safety properties (DestructionSafety, NoOrphanMessages) verified at scope 2 unconstrained and scope 3 state-constrained. See model/README.md for details.
 
 - **Annotated examples** (annotated-example-programs/): Worked examples showing protocol operation on ring topologies.
 
-## What's next: formal model
+## What's next: extending the formal model
 
-The protocol has enough shape to start formal modeling. The model should verify safety properties that hand reasoning can't reliably cover.
+The TLA+ model verifies safety for the core protocol. Remaining modeling work (see TODO.md):
 
-### What to model
+1. **Cascading GC release.** DestroyConfirmedCycle currently removes all members atomically. A more realistic model would release references one at a time and let members self-reap as their rc reaches 0.
 
-In priority order:
+2. **Per-hop epoch checking.** Traces carry a set of actor IDs, not an ordered list of (ACTOR IDENTIFIER, EPOCH) pairs. Adding per-hop epochs would make the model more faithful and potentially fix CandidateSoundness.
 
-1. **TRACE ROUTE propagation and cycle detection.** Actors send and forward traces. Cycles are detected when an actor sees its own ID. Verify: every actual cycle is eventually detected (completeness). No false cycles are detected for non-cyclic topologies (soundness).
-
-2. **Epoch-based staleness detection.** Actors increment epochs on state changes. Protocol messages carry epochs. Stale messages are discarded. Verify: no stale trace leads to collecting a live actor. Identify which state changes must trigger an epoch increment.
-
-3. **Confirmation and destruction.** Leader sends CONFIRM BLOCKED, members respond. Confirmed cycles are destroyed via RELEASE and GC release. Verify: only truly dead cycles are confirmed. Members can't self-reap during confirmation. Destruction cascades correctly (rc drops, further self-reaps).
-
-4. **CONNECTION reset and ACTOR IDENTIFIER reuse.** When an actor GC releases another to rc 0, the CONNECTION is reset. An address can be reused by a new actor. Verify: stale protocol state doesn't cause incorrect behavior after ID reuse. In-flight protocol messages to freed addresses are handled safely (by epoch or by confirmation failure).
-
-5. **Self-reap safety.** Actors with rc=0 and empty queues self-reap without any central coordination. Verify: no entity holds a dangling pointer after self-reap. Cascading self-reap terminates.
-
-### What the existing model provides
-
-The Alloy model already has:
-- Actor sig with id, active/destroyed status, inMem (memory references), inMap (actor map)
-- Message FIFO queues (AppMessage with inArgs)
-- Connection sig (from, to)
-- Trace and TraceElement sigs (linked list structure)
-- State changes: spawn, reduce memory, send/receive app messages
-- Temporal logic framework (always/eventually)
-
-This provides the actor and message infrastructure. The protocol logic (trace handling, cycle detection, confirmation, destruction, epoch, CONNECTION reset) needs to be built on top.
-
-### Modeling tool
-
-The existing model uses Alloy 6 (temporal logic). The model should continue in Alloy unless a specific safety property is better suited to TLA+. The choice between tools is a judgment call when starting the modeling work — if the protocol's concurrency properties (message ordering, interleaving of actor actions) are hard to express in Alloy's temporal logic, TLA+ may be more natural.
+3. **Leadership determination and delegation.** The model uses a fixed leader (detectedBy). The protocol delegates leadership to the first denier on DENIED.
 
 ## Key source code references (ponyc)
 

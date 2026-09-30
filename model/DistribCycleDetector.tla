@@ -2,7 +2,8 @@
 (**************************************************************************)
 (* TLA+ specification of the distributed cycle detection protocol for     *)
 (* Pony actors. Models trace propagation, epoch-based staleness, cycle    *)
-(* candidate detection, confirmation, destruction, self-reap, and         *)
+(* candidate detection, multi-step confirmation via CONFIRM BLOCKED /     *)
+(* CONFIRMED / DENIED message exchange, destruction, self-reap, and       *)
 (* CONNECTION reset with ACTOR IDENTIFIER reuse.                          *)
 (**************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets, TLC
@@ -20,14 +21,18 @@ VARIABLES
     messages,           \* set of messages in transit (records)
     cycleCandidates,    \* set of detected cycle candidates
     confirmedCycles,    \* set of confirmed cycles
-    destroyed           \* set of destroyed actor ids
+    destroyed,          \* set of destroyed actor ids
+    pendingConfirmation \* set of candidates awaiting confirmation responses
 
 vars == <<actors, epoch, inMem, messages, cycleCandidates,
-          confirmedCycles, destroyed>>
+          confirmedCycles, destroyed, pendingConfirmation>>
 
 \* Message types
 TraceRouteMsg == "TraceRoute"
 AppMsg == "App"
+ConfirmBlockedMsg == "ConfirmBlocked"
+ConfirmedMsg == "Confirmed"
+DeniedMsg == "Denied"
 
 (**************************************************************************)
 (* Helper operators                                                       *)
@@ -54,6 +59,10 @@ IsRealCycle(members) ==
     /\ members # {}
     /\ \A a \in members : ReachableThroughSet(a, members)
 
+\* Is a message a confirmation protocol message?
+IsProtocolMsg(m) ==
+    m.type \in {ConfirmBlockedMsg, ConfirmedMsg, DeniedMsg}
+
 (**************************************************************************)
 (* Initial state                                                          *)
 (**************************************************************************)
@@ -67,6 +76,7 @@ Init ==
     /\ cycleCandidates = {}
     /\ confirmedCycles = {}
     /\ destroyed = {}
+    /\ pendingConfirmation = {}
 
 (**************************************************************************)
 (* Actions                                                                *)
@@ -82,7 +92,8 @@ SpawnActor(spawner) ==
         /\ epoch' = [epoch EXCEPT ![newId] = 0]
         /\ inMem' = [inMem EXCEPT ![spawner] = @ \union {newId},
                                    ![newId] = {}]
-        /\ UNCHANGED <<messages, cycleCandidates, confirmedCycles, destroyed>>
+        /\ UNCHANGED <<messages, cycleCandidates, confirmedCycles,
+                        destroyed, pendingConfirmation>>
 
 \* Reuse a destroyed actor's id for a new actor.
 \* The spawner gets a reference; the new actor starts fresh.
@@ -100,7 +111,8 @@ ReuseActorId(spawner) ==
         \* are NOT automatically cleared — the protocol must handle this
         \* via confirmation checks. This tests whether confirmation is
         \* robust to id reuse.
-        /\ UNCHANGED <<messages, cycleCandidates, confirmedCycles>>
+        /\ UNCHANGED <<messages, cycleCandidates, confirmedCycles,
+                        pendingConfirmation>>
 
 \* An actor drops exactly one reference, incrementing its epoch.
 \* CONNECTION reset: when the last reference to another actor is dropped,
@@ -122,7 +134,7 @@ ReduceMem(actor) ==
                                               THEN @ + 1
                                               ELSE @]
         /\ UNCHANGED <<actors, messages, cycleCandidates,
-                        confirmedCycles, destroyed>>
+                        confirmedCycles, destroyed, pendingConfirmation>>
 
 \* An actor sends an application message carrying one actor reference
 SendAppMessage(sender) ==
@@ -136,7 +148,8 @@ SendAppMessage(sender) ==
                    to |-> receiver,
                    args |-> {arg}]}
             /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
-                            confirmedCycles, destroyed>>
+                            confirmedCycles, destroyed,
+                            pendingConfirmation>>
 
 \* An actor receives an application message and acquires references
 ReceiveAppMessage(msg) ==
@@ -146,7 +159,7 @@ ReceiveAppMessage(msg) ==
     /\ inMem' = [inMem EXCEPT ![msg.to] = @ \union (msg.args \ {msg.to})]
     /\ messages' = messages \ {msg}
     /\ UNCHANGED <<actors, epoch, cycleCandidates, confirmedCycles,
-                    destroyed>>
+                    destroyed, pendingConfirmation>>
 
 \* An actor initiates a trace to a referenced actor
 InitiateTrace(initiator) ==
@@ -161,7 +174,7 @@ InitiateTrace(initiator) ==
                originator |-> initiator,
                originatorEpoch |-> epoch[initiator]]}
         /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
-                        confirmedCycles, destroyed>>
+                        confirmedCycles, destroyed, pendingConfirmation>>
 
 \* An actor receives a trace whose originator is NOT itself; forwards it
 ForwardTrace(msg) ==
@@ -179,7 +192,7 @@ ForwardTrace(msg) ==
                originator |-> msg.originator,
                originatorEpoch |-> msg.originatorEpoch]}
         /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
-                        confirmedCycles, destroyed>>
+                        confirmedCycles, destroyed, pendingConfirmation>>
 
 \* An actor receives a trace whose originator IS itself, epoch matches
 DetectCycle(msg) ==
@@ -195,7 +208,8 @@ DetectCycle(msg) ==
                  members |-> members,
                  detectedBy |-> msg.to]}
     /\ messages' = messages \ {msg}
-    /\ UNCHANGED <<actors, epoch, inMem, confirmedCycles, destroyed>>
+    /\ UNCHANGED <<actors, epoch, inMem, confirmedCycles, destroyed,
+                    pendingConfirmation>>
 
 \* An actor receives a trace whose originator IS itself, epoch mismatch
 DiscardStaleTrace(msg) ==
@@ -206,39 +220,133 @@ DiscardStaleTrace(msg) ==
     /\ msg.originatorEpoch # epoch[msg.to]
     /\ messages' = messages \ {msg}
     /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
+                    confirmedCycles, destroyed, pendingConfirmation>>
+
+(**************************************************************************)
+(* Multi-step confirmation                                                *)
+(* The leader sends CONFIRM BLOCKED to each member. Each member checks    *)
+(* local conditions and responds CONFIRMED or DENIED. The leader          *)
+(* collects responses and either confirms or abandons the candidate.      *)
+(**************************************************************************)
+
+\* The leader initiates confirmation by sending CONFIRM BLOCKED to
+\* each cycle member (including itself — uniform processing).
+SendConfirmBlocked(candidate) ==
+    /\ candidate \in cycleCandidates
+    /\ Alive(candidate.detectedBy)
+    /\ Cardinality(messages) + Cardinality(candidate.members) <= MaxMessages
+    /\ LET cand == [members |-> candidate.members,
+                     detectedBy |-> candidate.detectedBy]
+       IN /\ messages' = messages \union
+              {[type |-> ConfirmBlockedMsg,
+                to |-> m,
+                candidate |-> cand] : m \in candidate.members}
+          /\ pendingConfirmation' = pendingConfirmation \union {cand}
+    /\ cycleCandidates' = cycleCandidates \ {candidate}
+    /\ UNCHANGED <<actors, epoch, inMem, confirmedCycles, destroyed>>
+
+\* A member receives CONFIRM BLOCKED and confirms. All local conditions
+\* hold: empty queue, no external references, no in-flight AppMsg
+\* references. The in-flight AppMsg check simulates ORCA's rc accounting,
+\* which the model lacks.
+RespondConfirmed(msg) ==
+    /\ msg \in messages
+    /\ msg.type = ConfirmBlockedMsg
+    /\ Alive(msg.to)
+    \* Empty queue: no other messages addressed to this actor
+    /\ MessagesTo(msg.to) \ {msg} = {}
+    \* RC check: no actor outside the cycle references this member
+    /\ ~\E other \in (actors \ destroyed) \ msg.candidate.members :
+        msg.to \in inMem[other]
+    \* In-flight reference check: no AppMsg carries a reference to this
+    \* member. Simulates ORCA's rc accounting — in the real protocol,
+    \* rc = cycle_appearance_count implies no external in-flight refs.
+    /\ ~\E m \in messages :
+        m.type = AppMsg /\ msg.to \in m.args
+    /\ messages' = (messages \ {msg}) \union {[
+           type |-> ConfirmedMsg,
+           to |-> msg.candidate.detectedBy,
+           from |-> msg.to,
+           candidate |-> msg.candidate]}
+    /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
+                    confirmedCycles, destroyed, pendingConfirmation>>
+
+\* A member receives CONFIRM BLOCKED and denies — at least one local
+\* condition fails.
+RespondDenied(msg) ==
+    /\ msg \in messages
+    /\ msg.type = ConfirmBlockedMsg
+    /\ Alive(msg.to)
+    \* At least one condition fails
+    /\ \/ MessagesTo(msg.to) \ {msg} # {}
+       \/ \E other \in (actors \ destroyed) \ msg.candidate.members :
+           msg.to \in inMem[other]
+       \/ \E m \in messages :
+           m.type = AppMsg /\ msg.to \in m.args
+    /\ messages' = (messages \ {msg}) \union {[
+           type |-> DeniedMsg,
+           to |-> msg.candidate.detectedBy,
+           from |-> msg.to,
+           candidate |-> msg.candidate]}
+    /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
+                    confirmedCycles, destroyed, pendingConfirmation>>
+
+\* All members confirmed. The leader moves the candidate to
+\* confirmedCycles and consumes the response messages.
+ConfirmationSucceeded(pending) ==
+    /\ pending \in pendingConfirmation
+    \* Every member sent CONFIRMED
+    /\ \A m \in pending.members :
+        \E resp \in messages :
+            /\ resp.type = ConfirmedMsg
+            /\ resp.to = pending.detectedBy
+            /\ resp.from = m
+            /\ resp.candidate = pending
+    /\ LET responses == {resp \in messages :
+               /\ resp.type = ConfirmedMsg
+               /\ resp.to = pending.detectedBy
+               /\ resp.candidate = pending}
+       IN messages' = messages \ responses
+    /\ confirmedCycles' = confirmedCycles \union {[
+           members |-> pending.members,
+           confirmedBy |-> pending.detectedBy]}
+    /\ pendingConfirmation' = pendingConfirmation \ {pending}
+    /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates, destroyed>>
+
+\* At least one member denied. The leader abandons the candidate and
+\* consumes all response messages.
+ConfirmationFailed(pending) ==
+    /\ pending \in pendingConfirmation
+    \* Every member has responded (confirmed or denied)
+    /\ \A m \in pending.members :
+        \E resp \in messages :
+            /\ resp.type \in {ConfirmedMsg, DeniedMsg}
+            /\ resp.to = pending.detectedBy
+            /\ resp.from = m
+            /\ resp.candidate = pending
+    \* At least one denied
+    /\ \E resp \in messages :
+        /\ resp.type = DeniedMsg
+        /\ resp.to = pending.detectedBy
+        /\ resp.candidate = pending
+    /\ LET responses == {resp \in messages :
+               /\ resp.type \in {ConfirmedMsg, DeniedMsg}
+               /\ resp.to = pending.detectedBy
+               /\ resp.candidate = pending}
+       IN messages' = messages \ responses
+    /\ pendingConfirmation' = pendingConfirmation \ {pending}
+    /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
                     confirmedCycles, destroyed>>
 
-\* Confirmation succeeds: all members still form a real cycle AND
-\* the only references to each member come from other members (rc check).
-ConfirmCandidate(candidate) ==
-    /\ candidate \in cycleCandidates
-    /\ IsRealCycle(candidate.members)
-    /\ \A a \in candidate.members : Alive(a)
-    \* RC check: no actor outside the cycle references any member
-    /\ \A a \in candidate.members :
-        ~\E other \in (actors \ destroyed) \ candidate.members :
-            a \in inMem[other]
-    \* No in-flight message carries a reference to any member
-    /\ \A a \in candidate.members :
-        ~\E m \in messages :
-            \/ (m.type = AppMsg /\ a \in m.args)
-            \/ (m.type = TraceRouteMsg /\ a \in m.visited)
-    \* No messages queued for any member (empty queue check)
-    /\ \A a \in candidate.members :
-        MessagesTo(a) = {}
-    /\ cycleCandidates' = cycleCandidates \ {candidate}
-    /\ confirmedCycles' = confirmedCycles \union {[
-           members |-> candidate.members,
-           confirmedBy |-> candidate.detectedBy]}
-    /\ UNCHANGED <<actors, epoch, inMem, messages, destroyed>>
-
-\* Confirmation fails: at least one member can't reach itself
+\* Confirmation fails: at least one member can't reach itself.
+\* Garbage-collects stale candidates before they enter the confirmation
+\* pipeline and waste message capacity.
 DenyCandidate(candidate) ==
     /\ candidate \in cycleCandidates
     /\ ~IsRealCycle(candidate.members)
     /\ cycleCandidates' = cycleCandidates \ {candidate}
     /\ UNCHANGED <<actors, epoch, inMem, messages,
-                    confirmedCycles, destroyed>>
+                    confirmedCycles, destroyed, pendingConfirmation>>
 
 \* Destroy a confirmed cycle: remove all members.
 \* Re-checks all confirmation conditions.
@@ -264,14 +372,20 @@ DestroyConfirmedCycle(confirmed) ==
                     IF a \in confirmed.members
                     THEN {}
                     ELSE inMem[a] \ confirmed.members]
-    \* Remove messages to/from destroyed actors
+    \* Remove messages to/from destroyed actors, including protocol
+    \* messages whose candidate involves a destroyed member
     /\ messages' = {m \in messages :
                        /\ m.to \notin confirmed.members
                        /\ (m.type = TraceRouteMsg =>
-                           m.originator \notin confirmed.members)}
+                           m.originator \notin confirmed.members)
+                       /\ (IsProtocolMsg(m) =>
+                           m.candidate.members \cap confirmed.members = {})}
     \* Remove candidates involving destroyed actors
     /\ cycleCandidates' = {c \in cycleCandidates :
                               c.members \cap confirmed.members = {}}
+    \* Remove pending confirmations involving destroyed actors
+    /\ pendingConfirmation' = {p \in pendingConfirmation :
+                                  p.members \cap confirmed.members = {}}
     /\ UNCHANGED <<actors, epoch>>
 
 \* Self-reap: an actor with rc=0 and no messages in its queue.
@@ -285,6 +399,11 @@ SelfReap(actor) ==
         \/ m.to = actor
         \/ (m.type = AppMsg /\ actor \in m.args)
         \/ (m.type = TraceRouteMsg /\ actor \in m.visited)
+    \* Not involved in any pending confirmation
+    /\ ~\E p \in pendingConfirmation : actor \in p.members
+    \* No protocol message references this actor in a candidate
+    /\ ~\E m \in messages :
+        IsProtocolMsg(m) /\ actor \in m.candidate.members
     /\ destroyed' = destroyed \union {actor}
     /\ inMem' = [inMem EXCEPT ![actor] = {}]
     \* Remove candidates involving this actor
@@ -292,6 +411,8 @@ SelfReap(actor) ==
                               actor \notin c.members}
     /\ confirmedCycles' = {c \in confirmedCycles :
                               actor \notin c.members}
+    /\ pendingConfirmation' = {p \in pendingConfirmation :
+                                  actor \notin p.members}
     /\ UNCHANGED <<actors, epoch, messages>>
 
 (**************************************************************************)
@@ -308,8 +429,12 @@ Next ==
     \/ \E m \in messages : ForwardTrace(m)
     \/ \E m \in messages : DetectCycle(m)
     \/ \E m \in messages : DiscardStaleTrace(m)
-    \/ \E c \in cycleCandidates : ConfirmCandidate(c)
+    \/ \E c \in cycleCandidates : SendConfirmBlocked(c)
     \/ \E c \in cycleCandidates : DenyCandidate(c)
+    \/ \E m \in messages : RespondConfirmed(m)
+    \/ \E m \in messages : RespondDenied(m)
+    \/ \E p \in pendingConfirmation : ConfirmationSucceeded(p)
+    \/ \E p \in pendingConfirmation : ConfirmationFailed(p)
     \/ \E c \in confirmedCycles : DestroyConfirmedCycle(c)
     \/ \E a \in actors : SelfReap(a)
 
@@ -335,13 +460,12 @@ NoOrphanMessages ==
     \A m \in messages : m.to \notin destroyed
 
 \* STATE CONSTRAINT: bounds total state complexity for tractable checking.
-\* This prunes states with many simultaneous objects. Confirmation and
-\* destruction require empty queues, so the constraint doesn't affect
-\* those paths much, but it may miss bugs requiring many concurrent
-\* messages during non-destruction actions.
+\* Confirmation protocol messages and pendingConfirmation records count
+\* toward the bound.
 StateConstraint ==
     Cardinality(actors) + Cardinality(messages)
     + Cardinality(cycleCandidates) + Cardinality(confirmedCycles)
-    + Cardinality(destroyed) <= MaxActors + MaxMessages
+    + Cardinality(destroyed) + Cardinality(pendingConfirmation)
+    <= MaxActors + MaxMessages
 
 =============================================================================
