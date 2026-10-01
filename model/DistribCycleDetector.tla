@@ -117,6 +117,25 @@ Init ==
     /\ pendingConfirmation = {}
     /\ sentTraces = {}
 
+\* Three actors with two overlapping cycles: {1,2} and {2,3}.
+\* Actor 2 knows both cycles; actors 1 and 3 start with empty knowledge.
+InitOverlapping ==
+    /\ actors = {1, 2, 3}
+    /\ epoch = [a \in ActorIds |-> 0]
+    /\ inMem = [a \in ActorIds |->
+           IF a = 1 THEN {2}
+           ELSE IF a = 2 THEN {1, 3}
+           ELSE {2}]
+    /\ messages = {}
+    /\ knownCycles = [a \in ActorIds |->
+           IF a = 2 THEN {{1, 2}, {2, 3}}
+           ELSE {}]
+    /\ cycleCandidates = {}
+    /\ confirmedCycles = {}
+    /\ destroyed = {}
+    /\ pendingConfirmation = {}
+    /\ sentTraces = {}
+
 \* All actors alive, each referencing every other
 InitFullyConnected ==
     /\ actors = ActorIds
@@ -729,6 +748,8 @@ Next ==
 
 Spec == Init /\ [][Next]_vars
 
+SpecOverlapping == InitOverlapping /\ [][Next]_vars
+
 SpecFC == InitFullyConnected /\ [][Next]_vars
 
 (**************************************************************************)
@@ -755,6 +776,20 @@ NoOrphanMessages ==
 \* LEADERSHIP VALIDITY: the leader of every cycle candidate is a member.
 LeadershipValidity ==
     \A c \in cycleCandidates : c.detectedBy \in c.members
+
+\* STATE CONSTRAINT (overlapping): relaxed budget for 3-member component
+\* confirmation. Budget = MaxActors + MaxMessages + MaxActors (= 9 at
+\* scope 3), accommodating the peak sum during SendConfirmBlocked.
+\* sentTraces is excluded from the budget and capped at 0 to keep the
+\* state space tractable. The overlapping init pre-loads cycle knowledge,
+\* so trace deduplication is not needed to reach the confirmation path.
+OverlappingConstraint ==
+    /\ Cardinality(actors) + Cardinality(messages)
+       + Cardinality(cycleCandidates) + Cardinality(confirmedCycles)
+       + Cardinality(destroyed) + Cardinality(pendingConfirmation)
+       + KnownCyclesCount
+       <= MaxActors + MaxMessages + MaxActors
+    /\ Cardinality(sentTraces) = 0
 
 \* STATE CONSTRAINT: bounds total state complexity for tractable checking.
 StateConstraint ==
