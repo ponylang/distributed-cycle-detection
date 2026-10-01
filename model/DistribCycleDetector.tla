@@ -2,12 +2,12 @@
 (**************************************************************************)
 (* TLA+ specification of the distributed cycle detection protocol for     *)
 (* Pony actors. Models trace propagation with per-hop epoch checking,     *)
-(* CONNECTION-level trace deduplication, cycle candidate detection,       *)
-(* leadership determination (lowest actor identifier tiebreaker),         *)
-(* multi-step confirmation via CONFIRM BLOCKED / CONFIRMED / DENIED       *)
-(* message exchange, leadership delegation via DELEGATE on confirmation   *)
-(* failure, cascading GC release via RELEASE messages, self-reap, and     *)
-(* CONNECTION reset with ACTOR IDENTIFIER reuse.                          *)
+(* CONNECTION-level trace deduplication, per-actor cycle knowledge with    *)
+(* gossip propagation, connected component merging, component-level       *)
+(* confirmation via CONFIRM BLOCKED / CONFIRMED / DENIED message          *)
+(* exchange, leadership delegation via DELEGATE on confirmation failure,  *)
+(* cascading GC release via RELEASE messages, self-reap, and CONNECTION   *)
+(* reset with ACTOR IDENTIFIER reuse.                                     *)
 (**************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets, TLC
 
@@ -22,13 +22,14 @@ VARIABLES
     epoch,              \* epoch[a] = current epoch of actor a
     inMem,              \* inMem[a] = set of actors that a references
     messages,           \* set of messages in transit (records)
-    cycleCandidates,    \* set of detected cycle candidates
+    knownCycles,        \* knownCycles[a] = set of member-sets (cycles detected or received by actor a)
+    cycleCandidates,    \* set of proposed component candidates
     confirmedCycles,    \* set of confirmed cycles
     destroyed,          \* set of destroyed actor ids
     pendingConfirmation,\* set of candidates awaiting confirmation responses
     sentTraces          \* set of [from, to, chain] records for deduplication
 
-vars == <<actors, epoch, inMem, messages, cycleCandidates,
+vars == <<actors, epoch, inMem, messages, knownCycles, cycleCandidates,
           confirmedCycles, destroyed, pendingConfirmation, sentTraces>>
 
 \* Message types
@@ -39,6 +40,7 @@ ConfirmedMsg == "Confirmed"
 DeniedMsg == "Denied"
 ReleaseMsg == "Release"
 DelegateMsg == "Delegate"
+InformCyclesMsg == "InformCycles"
 
 (**************************************************************************)
 (* Helper operators                                                       *)
@@ -67,14 +69,36 @@ IsRealCycle(members) ==
     /\ members # {}
     /\ \A a \in members : ReachableThroughSet(a, members)
 
-\* The leader of a member set: the member with the lowest actor identifier.
-\* In the model, each actor appears once per cycle, so "most appearances"
-\* is always a tie and the tiebreaker (lowest ID) is decisive.
-Leader(members) == CHOOSE a \in members : \A b \in members : a <= b
-
 \* Is a message a confirmation protocol message?
 IsConfirmationMsg(m) ==
     m.type \in {ConfirmBlockedMsg, ConfirmedMsg, DeniedMsg, DelegateMsg}
+
+\* Connected component containing startCycle, computed from a set of cycles.
+\* Fixed-depth expansion — correct for MaxActors <= 3.
+ComponentMembers(startCycle, cycles) ==
+    LET step0 == startCycle
+        overlap1 == UNION {c \in cycles : c \cap step0 # {}}
+        overlap2 == UNION {c \in cycles : c \cap overlap1 # {}}
+        overlap3 == UNION {c \in cycles : c \cap overlap2 # {}}
+    IN overlap3
+
+\* The cycles that belong to a component.
+ComponentCycles(startCycle, cycles) ==
+    LET members == ComponentMembers(startCycle, cycles)
+    IN {c \in cycles : c \cap members # {}}
+
+\* Component leader: most appearances across the component's cycles,
+\* lowest ID tiebreaker.
+ComponentLeader(cycles) ==
+    LET members == UNION cycles
+        Count(a) == Cardinality({c \in cycles : a \in c})
+    IN CHOOSE a \in members : \A b \in members :
+           \/ Count(a) > Count(b)
+           \/ (Count(a) = Count(b) /\ a <= b)
+
+\* Total (actor, cycle) pairs across all actors' knownCycles.
+KnownCyclesCount ==
+    Cardinality(UNION {{<<a, c>> : c \in knownCycles[a]} : a \in ActorIds})
 
 (**************************************************************************)
 (* Initial state                                                          *)
@@ -86,6 +110,7 @@ Init ==
     /\ epoch = [a \in ActorIds |-> 0]
     /\ inMem = [a \in ActorIds |-> {}]
     /\ messages = {}
+    /\ knownCycles = [a \in ActorIds |-> {}]
     /\ cycleCandidates = {}
     /\ confirmedCycles = {}
     /\ destroyed = {}
@@ -98,6 +123,7 @@ InitFullyConnected ==
     /\ epoch = [a \in ActorIds |-> 0]
     /\ inMem = [a \in ActorIds |-> ActorIds \ {a}]
     /\ messages = {}
+    /\ knownCycles = [a \in ActorIds |-> {}]
     /\ cycleCandidates = {}
     /\ confirmedCycles = {}
     /\ destroyed = {}
@@ -118,8 +144,9 @@ SpawnActor(spawner) ==
         /\ epoch' = [epoch EXCEPT ![newId] = 0]
         /\ inMem' = [inMem EXCEPT ![spawner] = @ \union {newId},
                                    ![newId] = {}]
-        /\ UNCHANGED <<messages, cycleCandidates, confirmedCycles,
-                        destroyed, pendingConfirmation, sentTraces>>
+        /\ UNCHANGED <<messages, knownCycles, cycleCandidates,
+                        confirmedCycles, destroyed, pendingConfirmation,
+                        sentTraces>>
 
 \* Reuse a destroyed actor's id for a new actor.
 \* The spawner gets a reference; the new actor starts fresh.
@@ -140,6 +167,7 @@ ReuseActorId(spawner) ==
         \* are NOT automatically cleared — the protocol must handle this
         \* via confirmation checks. This tests whether confirmation is
         \* robust to id reuse.
+        /\ knownCycles' = [knownCycles EXCEPT ![reusedId] = {}]
         /\ sentTraces' = {e \in sentTraces :
                              /\ e.from # reusedId
                              /\ e.to # reusedId
@@ -169,6 +197,8 @@ ReduceMem(actor) ==
         /\ epoch' = [epoch EXCEPT ![actor] = IF @ < MaxEpoch
                                               THEN @ + 1
                                               ELSE @]
+        /\ knownCycles' = [knownCycles EXCEPT ![actor] =
+                              {c \in @ : dropped \notin c}]
         /\ sentTraces' = {e \in sentTraces :
                              /\ ~(e.from = actor /\ e.to = dropped)
                              /\ actor \notin VisitedIds(e.chain)}
@@ -186,8 +216,8 @@ SendAppMessage(sender) ==
                    type |-> AppMsg,
                    to |-> receiver,
                    args |-> {arg}]}
-            /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
-                            confirmedCycles, destroyed,
+            /\ UNCHANGED <<actors, epoch, inMem, knownCycles,
+                            cycleCandidates, confirmedCycles, destroyed,
                             pendingConfirmation, sentTraces>>
 
 \* An actor receives an application message and acquires references
@@ -197,8 +227,9 @@ ReceiveAppMessage(msg) ==
     /\ Alive(msg.to)
     /\ inMem' = [inMem EXCEPT ![msg.to] = @ \union (msg.args \ {msg.to})]
     /\ messages' = messages \ {msg}
-    /\ UNCHANGED <<actors, epoch, cycleCandidates, confirmedCycles,
-                    destroyed, pendingConfirmation, sentTraces>>
+    /\ UNCHANGED <<actors, epoch, knownCycles, cycleCandidates,
+                    confirmedCycles, destroyed, pendingConfirmation,
+                    sentTraces>>
 
 \* An actor initiates a trace to a referenced actor
 InitiateTrace(initiator) ==
@@ -214,7 +245,7 @@ InitiateTrace(initiator) ==
                   to |-> target,
                   visited |-> chain]}
            /\ sentTraces' = sentTraces \union {entry}
-    /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
+    /\ UNCHANGED <<actors, epoch, inMem, knownCycles, cycleCandidates,
                     confirmedCycles, destroyed, pendingConfirmation>>
 
 \* An unvisited actor receives a trace and forwards it
@@ -235,7 +266,7 @@ ForwardTrace(msg) ==
                   to |-> target,
                   visited |-> augmented]}
            /\ sentTraces' = sentTraces \union {entry}
-    /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
+    /\ UNCHANGED <<actors, epoch, inMem, knownCycles, cycleCandidates,
                     confirmedCycles, destroyed, pendingConfirmation>>
 
 \* All outgoing connections have already seen this trace chain.
@@ -252,7 +283,7 @@ SuppressDuplicateTrace(msg) ==
         IN [from |-> msg.to, to |-> target, chain |-> augmented]
            \in sentTraces
     /\ messages' = messages \ {msg}
-    /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
+    /\ UNCHANGED <<actors, epoch, inMem, knownCycles, cycleCandidates,
                     confirmedCycles, destroyed, pendingConfirmation,
                     sentTraces>>
 
@@ -266,13 +297,11 @@ DetectCycle(msg) ==
     /\ \A i \in 1..Len(msg.visited) :
         msg.visited[i].epoch = epoch[msg.visited[i].id]
     /\ LET members == VisitedIds(msg.visited)
-       IN /\ ~\E c \in cycleCandidates : c.members = members
-          /\ cycleCandidates' = cycleCandidates \union {[
-                 members |-> members,
-                 detectedBy |-> Leader(members)]}
+       IN /\ members \notin knownCycles[msg.to]
+          /\ knownCycles' = [knownCycles EXCEPT ![msg.to] = @ \union {members}]
     /\ messages' = messages \ {msg}
-    /\ UNCHANGED <<actors, epoch, inMem, confirmedCycles, destroyed,
-                    pendingConfirmation, sentTraces>>
+    /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates, confirmedCycles,
+                    destroyed, pendingConfirmation, sentTraces>>
 
 \* An actor receives a trace whose originator IS itself but at least
 \* one per-hop epoch does not match its actor's current epoch.
@@ -284,7 +313,7 @@ DiscardStaleTrace(msg) ==
     /\ \E i \in 1..Len(msg.visited) :
         msg.visited[i].epoch # epoch[msg.visited[i].id]
     /\ messages' = messages \ {msg}
-    /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
+    /\ UNCHANGED <<actors, epoch, inMem, knownCycles, cycleCandidates,
                     confirmedCycles, destroyed, pendingConfirmation,
                     sentTraces>>
 
@@ -302,13 +331,11 @@ DetectSubCycle(msg) ==
            members == VisitedIds(subVisited)
        IN /\ \A i \in 1..Len(subVisited) :
                subVisited[i].epoch = epoch[subVisited[i].id]
-          /\ ~\E c \in cycleCandidates : c.members = members
-          /\ cycleCandidates' = cycleCandidates \union {[
-                 members |-> members,
-                 detectedBy |-> Leader(members)]}
+          /\ members \notin knownCycles[msg.to]
+          /\ knownCycles' = [knownCycles EXCEPT ![msg.to] = @ \union {members}]
     /\ messages' = messages \ {msg}
-    /\ UNCHANGED <<actors, epoch, inMem, confirmedCycles, destroyed,
-                    pendingConfirmation, sentTraces>>
+    /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates, confirmedCycles,
+                    destroyed, pendingConfirmation, sentTraces>>
 
 \* A trace arrives at a non-originator actor already in the visited
 \* sequence, but at least one per-hop epoch in the sub-cycle is stale.
@@ -323,9 +350,77 @@ DiscardStaleSubCycle(msg) ==
        IN \E i \in 1..Len(subVisited) :
            subVisited[i].epoch # epoch[subVisited[i].id]
     /\ messages' = messages \ {msg}
-    /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
+    /\ UNCHANGED <<actors, epoch, inMem, knownCycles, cycleCandidates,
                     confirmedCycles, destroyed, pendingConfirmation,
                     sentTraces>>
+
+(**************************************************************************)
+(* Per-actor cycle knowledge propagation                                  *)
+(* Actors gossip their component's cycle set to other component members.  *)
+(* The component leader proposes the merged component for confirmation.   *)
+(**************************************************************************)
+
+\* An actor sends its component's full cycle set to a component member
+\* who doesn't have complete knowledge.
+SendInformCycles(actor) ==
+    /\ Alive(actor)
+    /\ \E startCycle \in knownCycles[actor] :
+        /\ actor \in startCycle
+        /\ LET componentCycles == ComponentCycles(startCycle, knownCycles[actor])
+           IN \E target \in ComponentMembers(startCycle, knownCycles[actor]) :
+               /\ target # actor
+               /\ Alive(target)
+               /\ ~(componentCycles \subseteq knownCycles[target])
+               /\ Cardinality(messages) < MaxMessages
+               /\ messages' = messages \union {[
+                      type |-> InformCyclesMsg,
+                      to |-> target,
+                      cycles |-> componentCycles]}
+               /\ UNCHANGED <<actors, epoch, inMem, knownCycles,
+                               cycleCandidates, confirmedCycles, destroyed,
+                               pendingConfirmation, sentTraces>>
+
+\* An actor receives an inform message and unions the received cycles
+\* with its own knowledge.
+ReceiveInformCycles(msg) ==
+    /\ msg \in messages
+    /\ msg.type = InformCyclesMsg
+    /\ Alive(msg.to)
+    /\ knownCycles' = [knownCycles EXCEPT ![msg.to] = @ \union msg.cycles]
+    /\ messages' = messages \ {msg}
+    /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates, confirmedCycles,
+                    destroyed, pendingConfirmation, sentTraces>>
+
+\* The computed leader of a component proposes it into cycleCandidates
+\* for confirmation.
+ProposeComponent(actor) ==
+    /\ Alive(actor)
+    /\ \E startCycle \in knownCycles[actor] :
+        /\ actor \in startCycle
+        /\ LET component == ComponentMembers(startCycle, knownCycles[actor])
+               componentCycles == ComponentCycles(startCycle, knownCycles[actor])
+               leader == ComponentLeader(componentCycles)
+           IN /\ leader = actor
+              /\ IsRealCycle(component)
+              /\ ~\E c \in cycleCandidates : c.members = component
+              /\ ~\E p \in pendingConfirmation : p.members = component
+              /\ cycleCandidates' = cycleCandidates \union {[
+                     members |-> component,
+                     detectedBy |-> leader]}
+              /\ UNCHANGED <<actors, epoch, inMem, messages, knownCycles,
+                              confirmedCycles, destroyed, pendingConfirmation,
+                              sentTraces>>
+
+\* An actor removes a cycle from its knownCycles when the cycle is no
+\* longer a real cycle.
+ForgetInvalidCycle(actor) ==
+    /\ Alive(actor)
+    /\ \E cycle \in knownCycles[actor] :
+        /\ ~IsRealCycle(cycle)
+        /\ knownCycles' = [knownCycles EXCEPT ![actor] = @ \ {cycle}]
+        /\ UNCHANGED <<actors, epoch, inMem, messages, cycleCandidates,
+                        confirmedCycles, destroyed, pendingConfirmation,
+                        sentTraces>>
 
 (**************************************************************************)
 (* Multi-step confirmation                                                *)
@@ -349,8 +444,8 @@ SendConfirmBlocked(candidate) ==
                 candidate |-> cand] : m \in candidate.members}
           /\ pendingConfirmation' = pendingConfirmation \union {cand}
     /\ cycleCandidates' = cycleCandidates \ {candidate}
-    /\ UNCHANGED <<actors, epoch, inMem, confirmedCycles, destroyed,
-                    sentTraces>>
+    /\ UNCHANGED <<actors, epoch, inMem, knownCycles, confirmedCycles,
+                    destroyed, sentTraces>>
 
 \* A member receives CONFIRM BLOCKED and confirms. All local conditions
 \* hold: empty queue, no external references, no in-flight AppMsg
@@ -375,7 +470,7 @@ RespondConfirmed(msg) ==
            to |-> msg.candidate.detectedBy,
            from |-> msg.to,
            candidate |-> msg.candidate]}
-    /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
+    /\ UNCHANGED <<actors, epoch, inMem, knownCycles, cycleCandidates,
                     confirmedCycles, destroyed, pendingConfirmation,
                     sentTraces>>
 
@@ -396,7 +491,7 @@ RespondDenied(msg) ==
            to |-> msg.candidate.detectedBy,
            from |-> msg.to,
            candidate |-> msg.candidate]}
-    /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
+    /\ UNCHANGED <<actors, epoch, inMem, knownCycles, cycleCandidates,
                     confirmedCycles, destroyed, pendingConfirmation,
                     sentTraces>>
 
@@ -420,8 +515,8 @@ ConfirmationSucceeded(pending) ==
            members |-> pending.members,
            confirmedBy |-> pending.detectedBy]}
     /\ pendingConfirmation' = pendingConfirmation \ {pending}
-    /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates, destroyed,
-                    sentTraces>>
+    /\ UNCHANGED <<actors, epoch, inMem, knownCycles, cycleCandidates,
+                    destroyed, sentTraces>>
 
 \* At least one member denied. The leader abandons the candidate and
 \* consumes all response messages.
@@ -445,7 +540,7 @@ ConfirmationFailed(pending) ==
                /\ resp.candidate = pending}
        IN messages' = messages \ responses
     /\ pendingConfirmation' = pendingConfirmation \ {pending}
-    /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
+    /\ UNCHANGED <<actors, epoch, inMem, knownCycles, cycleCandidates,
                     confirmedCycles, destroyed, sentTraces>>
 
 \* At least one member denied. The leader delegates leadership to one
@@ -485,7 +580,7 @@ DelegateLeadership(pending) ==
                      to |-> denier,
                      candidate |-> newCandidate]}
     /\ pendingConfirmation' = pendingConfirmation \ {pending}
-    /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
+    /\ UNCHANGED <<actors, epoch, inMem, knownCycles, cycleCandidates,
                     confirmedCycles, destroyed, sentTraces>>
 
 \* The new leader receives a DELEGATE message and adds the candidate
@@ -496,7 +591,7 @@ ReceiveDelegate(msg) ==
     /\ Alive(msg.to)
     /\ cycleCandidates' = cycleCandidates \union {msg.candidate}
     /\ messages' = messages \ {msg}
-    /\ UNCHANGED <<actors, epoch, inMem, confirmedCycles,
+    /\ UNCHANGED <<actors, epoch, inMem, knownCycles, confirmedCycles,
                     destroyed, pendingConfirmation, sentTraces>>
 
 \* Confirmation fails: at least one member can't reach itself.
@@ -506,7 +601,7 @@ DenyCandidate(candidate) ==
     /\ candidate \in cycleCandidates
     /\ ~IsRealCycle(candidate.members)
     /\ cycleCandidates' = cycleCandidates \ {candidate}
-    /\ UNCHANGED <<actors, epoch, inMem, messages,
+    /\ UNCHANGED <<actors, epoch, inMem, messages, knownCycles,
                     confirmedCycles, destroyed, pendingConfirmation,
                     sentTraces>>
 
@@ -542,7 +637,7 @@ SendRelease(confirmed) ==
              to |-> m,
              confirmed |-> confirmed] : m \in confirmed.members}
     /\ confirmedCycles' = confirmedCycles \ {confirmed}
-    /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates,
+    /\ UNCHANGED <<actors, epoch, inMem, knownCycles, cycleCandidates,
                     destroyed, pendingConfirmation, sentTraces>>
 
 \* A member receives RELEASE and drops its references to other cycle
@@ -558,6 +653,8 @@ ProcessRelease(msg) ==
           /\ epoch' = [epoch EXCEPT ![msg.to] = IF @ < MaxEpoch
                                                  THEN @ + 1
                                                  ELSE @]
+          /\ knownCycles' = [knownCycles EXCEPT ![msg.to] =
+                                {c \in @ : c \cap others = {}}]
           /\ sentTraces' = {e \in sentTraces :
                                /\ ~(e.from = msg.to /\ e.to \in others)
                                /\ msg.to \notin VisitedIds(e.chain)}
@@ -583,6 +680,7 @@ SelfReap(actor) ==
         IsConfirmationMsg(m) /\ actor \in m.candidate.members
     /\ destroyed' = destroyed \union {actor}
     /\ inMem' = [inMem EXCEPT ![actor] = {}]
+    /\ knownCycles' = [knownCycles EXCEPT ![actor] = {}]
     \* Remove candidates involving this actor
     /\ cycleCandidates' = {c \in cycleCandidates :
                               actor \notin c.members}
@@ -613,6 +711,10 @@ Next ==
     \/ \E m \in messages : DiscardStaleTrace(m)
     \/ \E m \in messages : DetectSubCycle(m)
     \/ \E m \in messages : DiscardStaleSubCycle(m)
+    \/ \E a \in actors : SendInformCycles(a)
+    \/ \E m \in messages : ReceiveInformCycles(m)
+    \/ \E a \in actors : ProposeComponent(a)
+    \/ \E a \in actors : ForgetInvalidCycle(a)
     \/ \E c \in cycleCandidates : SendConfirmBlocked(c)
     \/ \E c \in cycleCandidates : DenyCandidate(c)
     \/ \E m \in messages : RespondConfirmed(m)
@@ -655,13 +757,11 @@ LeadershipValidity ==
     \A c \in cycleCandidates : c.detectedBy \in c.members
 
 \* STATE CONSTRAINT: bounds total state complexity for tractable checking.
-\* Confirmation protocol messages, pendingConfirmation records, and
-\* sentTraces entries count toward the bound.
 StateConstraint ==
     Cardinality(actors) + Cardinality(messages)
     + Cardinality(cycleCandidates) + Cardinality(confirmedCycles)
     + Cardinality(destroyed) + Cardinality(pendingConfirmation)
-    + Cardinality(sentTraces)
+    + Cardinality(sentTraces) + KnownCyclesCount
     <= MaxActors + MaxMessages
 
 =============================================================================
