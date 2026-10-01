@@ -152,7 +152,9 @@ ReuseActorId(spawner) ==
 \* all trace history and cycle state for that connection is cleared.
 \* The epoch increment catches stale in-flight traces via per-hop
 \* epoch checking; the sentTraces cleanup clears deduplication state
-\* so future traces on a re-established connection are not suppressed.
+\* for the dropped connection and any chain mentioning the actor,
+\* so future traces are not suppressed by stale history — especially
+\* under epoch saturation where the epoch doesn't change.
 \*
 \* Epoch saturation: when epoch reaches MaxEpoch, further drops don't
 \* increment it. A stale trace from after saturation carries the same
@@ -168,7 +170,8 @@ ReduceMem(actor) ==
                                               THEN @ + 1
                                               ELSE @]
         /\ sentTraces' = {e \in sentTraces :
-                             ~(e.from = actor /\ e.to = dropped)}
+                             /\ ~(e.from = actor /\ e.to = dropped)
+                             /\ actor \notin VisitedIds(e.chain)}
         /\ UNCHANGED <<actors, messages, cycleCandidates,
                         confirmedCycles, destroyed, pendingConfirmation>>
 
@@ -544,7 +547,8 @@ SendRelease(confirmed) ==
 
 \* A member receives RELEASE and drops its references to other cycle
 \* members. Increments epoch to invalidate stale traces; clears
-\* sentTraces entries for the dropped connections.
+\* sentTraces entries for the dropped connections and any chain
+\* mentioning the member, closing the epoch saturation liveness gap.
 ProcessRelease(msg) ==
     /\ msg \in messages
     /\ msg.type = ReleaseMsg
@@ -555,7 +559,8 @@ ProcessRelease(msg) ==
                                                  THEN @ + 1
                                                  ELSE @]
           /\ sentTraces' = {e \in sentTraces :
-                               ~(e.from = msg.to /\ e.to \in others)}
+                               /\ ~(e.from = msg.to /\ e.to \in others)
+                               /\ msg.to \notin VisitedIds(e.chain)}
     /\ messages' = messages \ {msg}
     /\ UNCHANGED <<actors, cycleCandidates, confirmedCycles,
                     destroyed, pendingConfirmation>>
