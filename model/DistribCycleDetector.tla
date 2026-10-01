@@ -124,6 +124,9 @@ SpawnActor(spawner) ==
 \* Reuse a destroyed actor's id for a new actor.
 \* The spawner gets a reference; the new actor starts fresh.
 \* CONNECTION reset: all protocol state for the old id is stale.
+\* Deduplication entries mentioning the old incarnation — as sender,
+\* target, or anywhere in a chain's visited sequence — are cleared
+\* so the new incarnation's traces are not suppressed by stale history.
 ReuseActorId(spawner) ==
     /\ Alive(spawner)
     /\ \E reusedId \in destroyed :
@@ -137,8 +140,12 @@ ReuseActorId(spawner) ==
         \* are NOT automatically cleared — the protocol must handle this
         \* via confirmation checks. This tests whether confirmation is
         \* robust to id reuse.
+        /\ sentTraces' = {e \in sentTraces :
+                             /\ e.from # reusedId
+                             /\ e.to # reusedId
+                             /\ reusedId \notin VisitedIds(e.chain)}
         /\ UNCHANGED <<messages, cycleCandidates, confirmedCycles,
-                        pendingConfirmation, sentTraces>>
+                        pendingConfirmation>>
 
 \* An actor drops exactly one reference, incrementing its epoch.
 \* CONNECTION reset: when the last reference to another actor is dropped,
@@ -579,7 +586,9 @@ SelfReap(actor) ==
     /\ pendingConfirmation' = {p \in pendingConfirmation :
                                   actor \notin p.members}
     /\ sentTraces' = {e \in sentTraces :
-                         e.from # actor /\ e.to # actor}
+                         /\ e.from # actor
+                         /\ e.to # actor
+                         /\ actor \notin VisitedIds(e.chain)}
     /\ UNCHANGED <<actors, epoch, messages>>
 
 (**************************************************************************)
