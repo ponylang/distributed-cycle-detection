@@ -39,7 +39,7 @@ Each actor maintains a single monotonic EPOCH counter. The EPOCH is included in 
 
 When a protocol message returns to the actor that originated it, the actor checks if the EPOCH in the message matches its current EPOCH. If the EPOCHs do not match, the message reflects stale state and is discarded.
 
-The EPOCH increments when the actor's state changes in a way that invalidates existing in-flight protocol messages (e.g., its connection set changes). The exact set of state changes that trigger an EPOCH increment is a design question to be resolved through formal modeling.
+The EPOCH increments when the actor loses a CONNECTION — either by GC releasing a reference (dropping a CONNECTION directly) or by processing a RELEASE message during cycle destruction (dropping CONNECTIONs to other cycle members). Losing a CONNECTION invalidates any in-flight TRACE ROUTE message that passed through the actor before the drop, because the trace reflects a topology that no longer exists. Gaining a CONNECTION does not increment the EPOCH — a new connection cannot invalidate an existing trace.
 
 ### TRACE ROUTE message
 
