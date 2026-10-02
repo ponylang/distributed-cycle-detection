@@ -306,15 +306,14 @@ SuppressDuplicateTrace(msg) ==
                     confirmedCycles, destroyed, pendingConfirmation,
                     sentTraces>>
 
-\* An actor receives a trace whose originator IS itself and all
-\* per-hop epochs match their actors' current epochs.
+\* An actor receives a trace whose originator IS itself and its own
+\* epoch entry matches its current epoch.
 DetectCycle(msg) ==
     /\ msg \in messages
     /\ msg.type = TraceRouteMsg
     /\ Alive(msg.to)
     /\ msg.visited[1].id = msg.to
-    /\ \A i \in 1..Len(msg.visited) :
-        msg.visited[i].epoch = epoch[msg.visited[i].id]
+    /\ msg.visited[1].epoch = epoch[msg.to]
     /\ LET members == VisitedIds(msg.visited)
        IN /\ members \notin knownCycles[msg.to]
           /\ knownCycles' = [knownCycles EXCEPT ![msg.to] = @ \union {members}]
@@ -322,15 +321,14 @@ DetectCycle(msg) ==
     /\ UNCHANGED <<actors, epoch, inMem, cycleCandidates, confirmedCycles,
                     destroyed, pendingConfirmation, sentTraces>>
 
-\* An actor receives a trace whose originator IS itself but at least
-\* one per-hop epoch does not match its actor's current epoch.
+\* An actor receives a trace whose originator IS itself but its own
+\* epoch entry does not match its current epoch.
 DiscardStaleTrace(msg) ==
     /\ msg \in messages
     /\ msg.type = TraceRouteMsg
     /\ Alive(msg.to)
     /\ msg.visited[1].id = msg.to
-    /\ \E i \in 1..Len(msg.visited) :
-        msg.visited[i].epoch # epoch[msg.visited[i].id]
+    /\ msg.visited[1].epoch # epoch[msg.to]
     /\ messages' = messages \ {msg}
     /\ UNCHANGED <<actors, epoch, inMem, knownCycles, cycleCandidates,
                     confirmedCycles, destroyed, pendingConfirmation,
@@ -338,7 +336,8 @@ DiscardStaleTrace(msg) ==
 
 \* A trace arrives at a non-originator actor already in the visited
 \* sequence. Extract the sub-cycle (from the actor's position to the
-\* end) and record it as a candidate if per-hop epochs match.
+\* end) and record it as a candidate if the detecting actor's own
+\* epoch entry matches its current epoch.
 DetectSubCycle(msg) ==
     /\ msg \in messages
     /\ msg.type = TraceRouteMsg
@@ -348,8 +347,7 @@ DetectSubCycle(msg) ==
     /\ LET pos == CHOOSE i \in 1..Len(msg.visited) : msg.visited[i].id = msg.to
            subVisited == SubSeq(msg.visited, pos, Len(msg.visited))
            members == VisitedIds(subVisited)
-       IN /\ \A i \in 1..Len(subVisited) :
-               subVisited[i].epoch = epoch[subVisited[i].id]
+       IN /\ subVisited[1].epoch = epoch[msg.to]
           /\ members \notin knownCycles[msg.to]
           /\ knownCycles' = [knownCycles EXCEPT ![msg.to] = @ \union {members}]
     /\ messages' = messages \ {msg}
@@ -357,7 +355,7 @@ DetectSubCycle(msg) ==
                     destroyed, pendingConfirmation, sentTraces>>
 
 \* A trace arrives at a non-originator actor already in the visited
-\* sequence, but at least one per-hop epoch in the sub-cycle is stale.
+\* sequence, but the detecting actor's own epoch entry is stale.
 DiscardStaleSubCycle(msg) ==
     /\ msg \in messages
     /\ msg.type = TraceRouteMsg
@@ -366,8 +364,7 @@ DiscardStaleSubCycle(msg) ==
     /\ msg.visited[1].id # msg.to
     /\ LET pos == CHOOSE i \in 1..Len(msg.visited) : msg.visited[i].id = msg.to
            subVisited == SubSeq(msg.visited, pos, Len(msg.visited))
-       IN \E i \in 1..Len(subVisited) :
-           subVisited[i].epoch # epoch[subVisited[i].id]
+       IN subVisited[1].epoch # epoch[msg.to]
     /\ messages' = messages \ {msg}
     /\ UNCHANGED <<actors, epoch, inMem, knownCycles, cycleCandidates,
                     confirmedCycles, destroyed, pendingConfirmation,
