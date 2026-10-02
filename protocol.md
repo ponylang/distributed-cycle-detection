@@ -29,9 +29,7 @@ ACTOR IDENTIFIERS need to be sortable such that one can say "this identifier is 
 
 A CONNECTION represents one actor's knowledge of and relationship with another actor. A CONNECTION is directional: from the actor that holds the reference to the actor being referenced.
 
-Each CONNECTION is identified by the target ACTOR IDENTIFIER. A CONNECTION carries state used by the protocol: the trace history (which TRACE ROUTE messages have been forwarded on this connection) and participation in known cycles.
-
-When an actor GC releases another actor to rc 0, the CONNECTION to that actor is reset — all trace history and cycle state associated with that CONNECTION is cleared. This prevents stale state from persisting when ACTOR IDENTIFIERS are reused.
+Each CONNECTION is identified by the target ACTOR IDENTIFIER. A CONNECTION carries state used by the protocol: the trace history (which TRACE ROUTE messages have been forwarded on this connection) and participation in known cycles. See CONNECTION lifecycle for the full reset mechanics.
 
 ### EPOCH
 
@@ -114,7 +112,23 @@ Cycles are independent of route order. Cycle (A,B) is the same as cycle (B,A). M
 
 Upon finding a cycle, the actor checks its set of known cycles to see if the newly found cycle is the same as or a subset of any known cycle. If the cycle is known then no further processing happens.
 
-When an actor finds a new cycle, it adds it to its set of known cycles. The finding actor informs all actors in the connected component of the full set of cycles that represents the connected component. Each actor that appears as a member of any known cycle is informed of all known cycles.
+When an actor finds a new cycle, it adds it to its set of known cycles.
+
+### Per-actor cycle knowledge and gossip
+
+Each actor maintains its own set of known cycles. This set is populated by local detection (finding a cycle in a received TRACE ROUTE message) and by gossip from other actors.
+
+When an actor's known cycles change, it computes the connected component: all cycles that transitively share at least one member. The actor sends an INFORM CYCLES message to each other member of the component, carrying the full set of cycles that make up the component. The recipient unions the received cycles with its own known cycle set.
+
+An actor removes a cycle from its known cycle set when it learns the cycle is no longer valid — a member's topology has changed such that the cycle's members no longer form a real cycle.
+
+### Connected component merging
+
+Overlapping cycles — cycles that share one or more members — are merged into a connected component before entering confirmation. The component's member set is the union of all overlapping cycles' member sets. The component is proposed as a single candidate for confirmation.
+
+Merging is necessary because overlapping cycles cannot be confirmed individually. A shared member's reference count reflects references from all overlapping cycles, not just one. Confirming a single cycle would require the shared member's rc to equal its appearance count in that cycle alone, but the references from other overlapping cycles inflate the count. Only the merged component's total appearance count matches the actual rc.
+
+The connected component is computed by transitive overlap expansion: starting from any cycle, collect all cycles that share a member with it, then all cycles that share a member with those, and so on until no more cycles are added. The result is the same regardless of which cycle starts the expansion.
 
 ## Leadership determination
 
@@ -127,23 +141,33 @@ When an actor finds a new cycle, it adds it to its set of known cycles. The find
 
 ## Cycle confirmation
 
-- If at the end of any scheduler run, the leader of a cycle has an empty queue and rc equal to the number of times it appears in the cycle then it will initiate a CONFIRM BLOCKED.
-- CONFIRM BLOCKED involves sending a message from the leader to each member of the cycle with the cycle to confirm.
-- If receiver has an empty queue, and rc equal to the number of times it is in the cycle, then it will send a CONFIRMED message to the leader. If any of the checks fail, it will send a DENIED to the leader.
-- If any actor sends back DENIED, then the leader will make the first DENIED sender the new leader via a DELEGATE message.
-- If all members send back CONFIRMED then the cycle is confirmed.
+All confirmation messages carry a candidate record that identifies the component being confirmed: the member set and the leader's ACTOR IDENTIFIER. Recipients use the candidate record to verify they are responding to the correct confirmation and to route responses back to the leader.
 
-Note: cycle members cannot self-reap during the confirmation window. A cycle member's rc is held above 0 by the other members' references. A member's rc can only drop to 0 during cycle destruction (after RELEASE). If the cycle breaks (an external actor drops a reference, or a member gets new work), the confirmation check (rc equals cycle appearance count) will fail and the member sends DENIED.
+- If at the end of any scheduler run, the leader of a component has an empty queue and rc equal to the number of times it appears in the component then it will initiate a CONFIRM BLOCKED.
+- CONFIRM BLOCKED involves sending a message from the leader to each member of the component, carrying the candidate record.
+- If receiver has an empty queue, and rc equal to the number of times it is in the component, then it will send a CONFIRMED message to the leader carrying the candidate record. If any of the checks fail, it will send a DENIED to the leader carrying the candidate record.
+- If any actor sends back DENIED, then the leader will make the first DENIED sender the new leader via a DELEGATE message carrying the candidate record. The new leader re-enters confirmation by sending CONFIRM BLOCKED.
+- If all members send back CONFIRMED then the component is confirmed.
 
-## Cycle destruction
+Note: component members cannot self-reap during the confirmation window. A member's rc is held above 0 by the other members' references. A member's rc can only drop to 0 during cycle destruction (after RELEASE). If the component breaks (an external actor drops a reference, or a member gets new work), the confirmation check (rc equals component appearance count) will fail and the member sends DENIED.
 
-- Leader sends RELEASE to all other members of the cycle set
-- Leader does a GC release of any member of the set that is in its actor map
-- Each member responds to RELEASE by doing a GC release of any member of the set that is in its actor map
+## Component destruction
+
+- Leader sends RELEASE to each member of the confirmed component, carrying the candidate record.
+- Leader does a GC release of any member of the component that is in its actor map.
+- Each member responds to RELEASE by doing a GC release of any member of the component that is in its actor map. This triggers the CONNECTION lifecycle cleanup for each dropped CONNECTION.
 - After GC releases, members' rc values drop. Members whose rc reaches 0 with empty queues self-reap.
 
 ## CONNECTION lifecycle
 
-- When an actor GC releases another actor to rc 0, the CONNECTION to that actor is reset: all trace history and cycle state for that CONNECTION is cleared.
-- If the released actor is part of a known cycle, the actor removes the cycle from its set of known cycles and informs all members of the cycle set that the cycle is no longer valid.
-- CONNECTIONs that were part of a removed cycle are reset.
+When an actor loses a CONNECTION — either by GC releasing a reference directly or by processing a RELEASE message during cycle destruction — the following state is cleared:
+
+- The CONNECTION itself is removed from the actor's set of outgoing CONNECTIONs.
+- The actor's EPOCH is incremented (invalidating any in-flight TRACE ROUTE message that passed through this actor before the drop).
+- Any known cycle that included the dropped actor is removed from the actor's known cycle set.
+- All trace deduplication entries for the dropped CONNECTION (where this actor sent a trace to the dropped target) are cleared.
+- All trace deduplication entries where this actor appears anywhere in a chain's visited sequence are cleared. This prevents stale entries from suppressing valid traces after the topology change — without it, an entry mentioning an actor whose topology changed could survive and suppress a trace that reflects the new topology.
+
+The same cleanup applies during RELEASE processing, where a member drops CONNECTIONs to all other members of the destroyed component. Any known cycle that includes any of the dropped members is removed from the actor's known cycle set.
+
+When an actor is destroyed (self-reap) or its ACTOR IDENTIFIER is reused, all trace deduplication entries mentioning the actor — as sender, as target, or anywhere in a chain's visited sequence — are cleared across the entire deduplication state.
