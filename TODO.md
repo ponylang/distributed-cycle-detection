@@ -2,9 +2,6 @@
 
 ## Protocol design
 
-- Document the MERGE operation for connected components (when overlapping cycles are discovered, how their member sets and cycle sets are unified).
-- Document the RESET operation for CONNECTIONs (what exactly gets cleared, what messages are sent to other cycle members).
-- Define how CONFIRM BLOCKED, CONFIRMED, DENIED, DELEGATE, and RELEASE messages carry enough information (cycle identity, EPOCHs) for recipients to validate them. The TLA+ model uses the candidate record (members + detectedBy) as the identity; the real implementation may need a more compact representation.
 - Evaluate trace deduplication storage: per-CONNECTION trace history could grow in highly-connected graphs. Consider bounds (cap size, expiry, bloom filters). Empirical evaluation needed against realistic Pony topologies.
 - Evaluate TRACE ROUTE trigger policy empirically: on-acquisition (eager) vs. on-block (lazy) vs. batched-on-block. The protocol mechanism is independent of the trigger — this is a performance tuning question.
 
