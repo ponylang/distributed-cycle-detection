@@ -1,9 +1,16 @@
 # TODO
 
-## Protocol design
+## Implementation
 
-- Evaluate trace deduplication storage: per-CONNECTION trace history could grow in highly-connected graphs. Consider bounds (cap size, expiry, bloom filters). Empirical evaluation needed against realistic Pony topologies.
-- Evaluate TRACE ROUTE trigger policy empirically: on-acquisition (eager) vs. on-block (lazy) vs. batched-on-block. The protocol mechanism is independent of the trigger — this is a performance tuning question.
+See `implementation-planning.md` for the full planning document. The remaining work is implementation design and empirical evaluation — the protocol specification (`protocol.md`) and formal model (`model/`) are complete.
+
+Open design questions:
+
+- Trace deduplication storage bounds (cap, expiry, bloom filters, or unbounded). Needs empirical evaluation against realistic Pony topologies.
+- TRACE ROUTE trigger policy (on-acquisition, on-block, batched-on-block). Needs empirical evaluation.
+- Runtime mode flag design (command-line, env var, compile-time).
+- Per-actor storage layout in ponyc runtime.
+- ORCA integration points (GC release → CONNECTION reset, rc → confirmation checks, self-reap guards).
 
 ## Formal model
 
@@ -12,9 +19,3 @@
 - ~~Model per-hop epoch checking. Traces currently carry a set of actor IDs, not an ordered list of (ACTOR IDENTIFIER, EPOCH) pairs. Adding per-hop epochs would make the model more faithful and potentially fix CandidateSoundness.~~ Done: PR #10. Traces carry per-hop (id, epoch) records.
 - ~~Model leadership determination and DELEGATE on DENIED. Currently the leader is fixed (detectedBy). In the protocol, leadership delegates to the first denier.~~ Done: PRs #12 and #13. Leader is lowest ID; DelegateLeadership sends DELEGATE to a denier on confirmation failure.
 - ~~Test the model against a fully connected actor setup.~~
-
-## Implementation planning
-
-- Design the runtime flag for selecting cycle detection mode (centralized CD, distributed protocol, ponynoblock). All three coexist.
-- Identify the per-actor storage needed for the protocol (known cycles, CONNECTION state, trace history, epoch counter, leadership state).
-- Plan integration with ORCA: how GC release triggers CONNECTION reset, how rc changes interact with confirmation checks.
