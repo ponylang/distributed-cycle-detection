@@ -73,7 +73,7 @@ This also needs empirical evaluation. The formal model uses on-acquisition but d
 
 The formal model verified safety across ~38M states at scope 3. Key findings that constrain implementation choices:
 
-- **Per-hop epoch checking is essential.** Every hop's epoch must be checked when a trace returns, not just the originator's. Originator-only checking misses topology changes at intermediate actors.
+- **Local-only epoch checking is sufficient.** The detecting actor checks only its own epoch entry when a trace returns. Intermediate actors' epochs go unchecked because the implementation has no way to read them. More false candidates reach the confirmation protocol than per-hop checking would allow, but the confirmation protocol catches them. Safety is verified under this weaker check.
 - **Component merging is required for correctness.** Overlapping cycles must be merged before confirmation. Confirming individual overlapping cycles fails because shared members' rc reflects all overlapping cycles.
 - **Confirmation must re-verify at RELEASE time.** Between confirmation and destruction, topology can change. SendRelease re-checks all conditions before initiating destruction.
 - **Chain-content cleanup prevents liveness gaps.** When clearing trace deduplication entries for a dropped CONNECTION, entries where the actor appears anywhere in a chain's visited sequence (not just as sender or target) must also be cleared. Without this, stale entries can suppress valid traces under epoch saturation.

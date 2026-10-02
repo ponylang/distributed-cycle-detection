@@ -4,9 +4,9 @@ TLA+ specification of the distributed cycle detection protocol. Uses TLC for exh
 
 ## What the model covers
 
-- TRACE ROUTE propagation and forwarding with per-hop epoch checking
+- TRACE ROUTE propagation and forwarding with local-only epoch checking
 - CONNECTION-level trace deduplication (suppresses duplicate chains per connection)
-- Epoch-based staleness detection (per-hop, not originator-only)
+- Epoch-based staleness detection (detecting actor's own epoch only)
 - Cycle candidate detection (pattern-1 originator detection and pattern-2 sub-cycle extraction)
 - Per-actor cycle knowledge propagation (gossip-based inform messages)
 - Connected component merging (overlapping cycles proposed as a single component)
@@ -18,17 +18,17 @@ TLA+ specification of the distributed cycle detection protocol. Uses TLC for exh
 
 ## Verified properties
 
-**DestructionSafety**: no alive actor holds a reference to a destroyed actor. Holds at scope 2 (unconstrained, 14.5M states) and scope 3 (state-constrained, 38.0M states, ~11 min). Also holds under fully connected initial topology at scope 2 (14.5M states) and scope 3 (37.4M states, ~10 min), and under overlapping cycles initial topology at scope 3 (37.4M states, ~13 min).
+**DestructionSafety**: no alive actor holds a reference to a destroyed actor. Holds at scope 2 (unconstrained, 14.5M states) and scope 3 (state-constrained, 38.0M states, ~13 min). Also holds under fully connected initial topology at scope 2 (14.5M states) and scope 3 (37.5M states, ~15 min), and under overlapping cycles initial topology at scope 3 (37.5M states, ~15 min).
 
 **NoOrphanMessages**: no in-flight message is addressed to a destroyed actor. Holds at same scopes, including fully connected and overlapping cycles initial topologies.
 
 **LeadershipValidity**: the leader of every cycle candidate is a member of that candidate. Holds at all scopes, including fully connected and overlapping cycles initial topologies.
 
-**CandidateSoundness**: every cycle candidate is a real cycle. Fails as expected — an actor can drop a reference after the candidate is recorded. Per-hop epoch checking prevents stale traces from producing candidates, but cannot prevent post-detection topology changes. The confirmation protocol catches these false candidates.
+**CandidateSoundness**: every cycle candidate is a real cycle. Fails as expected — an actor can drop a reference after the candidate is recorded. Local-only epoch checking catches traces that are stale from the detecting actor's perspective but cannot check intermediate actors' epochs, so more false candidates reach the pipeline than per-hop checking would allow. The confirmation protocol catches these false candidates.
 
 ## Findings
 
-1. Per-hop epoch checking eliminates false candidates from stale in-flight traces (where an intermediate actor's topology changed while the trace was in transit). CandidateSoundness still fails because topology can change after the candidate is recorded — this is inherent to any detection/confirmation split. Confirmation is required.
+1. Local-only epoch checking (detecting actor checks only its own epoch entry) is safe. The implementation cannot check intermediate actors' epochs — it only knows its own. The model now matches this: detection checks only the detecting actor's epoch, not every hop. More false candidates reach the confirmation pipeline than per-hop checking would allow (intermediate topology changes go undetected), but the confirmation protocol catches them. CandidateSoundness still fails because topology can change after the candidate is recorded — this is inherent to any detection/confirmation split. Confirmation is required.
 2. SelfReap must check all in-flight message references, not just messages addressed to the actor.
 3. Destruction must re-verify all confirmation conditions. An in-flight message from before confirmation can deliver a reference to a cycle member.
 4. Confirmation is robust to ACTOR IDENTIFIER reuse. Stale candidates from a previous incarnation either fail the topology/RC checks or describe a cycle that the new incarnation genuinely forms.
@@ -68,12 +68,12 @@ docker run --rm -v $(pwd)/model:/model -w /model \
 
 | File | Scope | Invariants | Constraint | Purpose |
 |------|-------|------------|------------|---------|
-| `DistribCycleDetector.cfg` | 3 actors, 3 messages, MaxEpoch=1 | DestructionSafety, NoOrphanMessages, LeadershipValidity | Yes | Main safety check (~11 min) |
-| `Scope2Safety.cfg` | 2 actors, 3 messages, MaxEpoch=2 | DestructionSafety, NoOrphanMessages, LeadershipValidity | No | Unconstrained safety check (~4 min) |
+| `DistribCycleDetector.cfg` | 3 actors, 3 messages, MaxEpoch=1 | DestructionSafety, NoOrphanMessages, LeadershipValidity | Yes | Main safety check (~13 min) |
+| `Scope2Safety.cfg` | 2 actors, 3 messages, MaxEpoch=2 | DestructionSafety, NoOrphanMessages, LeadershipValidity | No | Unconstrained safety check (~3 min) |
 | `CandidateSoundness.cfg` | 2 actors, 3 messages, MaxEpoch=2 | CandidateSoundness | No | Reproduce false-candidate counterexample (<1s) |
 | `FullyConnectedScope2.cfg` | 2 actors, 3 messages, MaxEpoch=2 | DestructionSafety, NoOrphanMessages, LeadershipValidity | No | Fully connected init, unconstrained (~4 min) |
-| `FullyConnectedScope3.cfg` | 3 actors, 3 messages, MaxEpoch=1 | DestructionSafety, NoOrphanMessages, LeadershipValidity | Yes | Fully connected init, state-constrained (~10 min) |
-| `OverlappingCycles.cfg` | 3 actors, 3 messages, MaxEpoch=1 | DestructionSafety, NoOrphanMessages, LeadershipValidity | Yes | Overlapping cycles init, state-constrained (~13 min) |
+| `FullyConnectedScope3.cfg` | 3 actors, 3 messages, MaxEpoch=1 | DestructionSafety, NoOrphanMessages, LeadershipValidity | Yes | Fully connected init, state-constrained (~15 min) |
+| `OverlappingCycles.cfg` | 3 actors, 3 messages, MaxEpoch=1 | DestructionSafety, NoOrphanMessages, LeadershipValidity | Yes | Overlapping cycles init, state-constrained (~15 min) |
 
 ## Modeling simplifications
 
