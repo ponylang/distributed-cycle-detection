@@ -98,12 +98,11 @@ New system message IDs (shift `ACTORMSG_APPLICATION_START` down to make room):
 ```c
 #define ACTORMSG_APPLICATION_START (UINT32_MAX - 16)
 #define ACTORMSG_DIST_TRACE       (UINT32_MAX - 15)  // TRACE ROUTE
-#define ACTORMSG_DIST_INFORM      (UINT32_MAX - 14)  // INFORM CYCLES
-#define ACTORMSG_DIST_CONFIRM     (UINT32_MAX - 13)  // CONFIRM BLOCKED
-#define ACTORMSG_DIST_CONFIRMED   (UINT32_MAX - 12)  // CONFIRMED
-#define ACTORMSG_DIST_DENIED      (UINT32_MAX - 11)  // DENIED
-#define ACTORMSG_DIST_DELEGATE    (UINT32_MAX - 10)  // DELEGATE
-#define ACTORMSG_DIST_DESTROY     (UINT32_MAX - 9)   // protocol's RELEASE (named DESTROY to avoid confusion with ACTORMSG_RELEASE which is the GC/ORCA release)
+#define ACTORMSG_DIST_CONFIRM     (UINT32_MAX - 14)  // CONFIRM BLOCKED
+#define ACTORMSG_DIST_CONFIRMED   (UINT32_MAX - 13)  // CONFIRMED
+#define ACTORMSG_DIST_DENIED      (UINT32_MAX - 12)  // DENIED
+#define ACTORMSG_DIST_DELEGATE    (UINT32_MAX - 11)  // DELEGATE
+#define ACTORMSG_DIST_DESTROY     (UINT32_MAX - 10)  // protocol's RELEASE (named DESTROY to avoid confusion with ACTORMSG_RELEASE which is the GC/ORCA release)
 // Existing centralized CD messages stay at their current IDs
 #define ACTORMSG_CHECKBLOCKED     (UINT32_MAX - 8)
 // ... rest unchanged
@@ -120,21 +119,24 @@ typedef struct dist_trace_msg_t {
   trace_chain_t* chain;  // heap-allocated, recipient takes ownership
 } dist_trace_msg_t;
 
-// INFORM CYCLES: carries a set of cycles
-typedef struct dist_inform_msg_t {
-  pony_msg_t msg;
-  cycle_t* cycles;  // array of cycles
-  size_t count;
-} dist_inform_msg_t;
-
-// CONFIRM BLOCKED, CONFIRMED, DENIED, DELEGATE, DESTROY:
-// all carry a candidate record identifying the component
+// CONFIRM BLOCKED, CONFIRMED, DELEGATE, DESTROY:
+// carry a candidate record identifying the component
 typedef struct dist_candidate_msg_t {
   pony_msg_t msg;
   pony_actor_t** members;  // sorted member set
   size_t member_count;
   pony_actor_t* leader;
 } dist_candidate_msg_t;
+
+// DENIED: carries a candidate record plus the denier's known cycles
+typedef struct dist_denied_msg_t {
+  pony_msg_t msg;
+  pony_actor_t** members;  // sorted member set
+  size_t member_count;
+  pony_actor_t* leader;
+  cycle_t* cycles;  // denier's known cycles
+  size_t cycle_count;
+} dist_denied_msg_t;
 ```
 
 **Allocation and send path**: all protocol message structs and their payloads (`trace_chain_t`, `cycle_t` arrays, member arrays) are allocated with `ponyint_pool_alloc_size()` and freed with `ponyint_pool_free_size()`. The recipient takes ownership of heap-allocated payloads (e.g., `dist_trace_msg_t.chain`) and frees them with the pool allocator after processing. No `malloc`/`free` — all allocations go through the pool allocator for consistency with the runtime's memory model.
@@ -266,7 +268,7 @@ When a distributed-mode actor receives `ACTORMSG_DIST_TRACE`:
    - If actor has no outgoing CONNECTIONs: discard
    - If actor's own ID is in the chain:
      - Check this actor's own entry's epoch against its current epoch. If it doesn't match, the trace is stale — discard it.
-     - If the epoch matches: extract cycle, add to known cycles, trigger gossip.
+     - If the epoch matches: extract cycle, add to known cycles.
      - **Per-hop epoch checking — model vs. implementation**: the TLA+ model checks every entry's epoch against that entry's actor's current epoch (it has global state access). A real distributed implementation cannot do this — the detecting actor only knows its own current epoch. The detecting actor checks its own entry; intermediate actors' epoch staleness is caught by the confirmation protocol (when a member receives CONFIRM BLOCKED, it checks its own rc and queue state, which will have changed if its topology changed since forwarding). The confirmation protocol is the backstop for intermediate topology changes, not trace-time epoch checking. This is consistent with model finding #1: "Confirmation is required."
    - If actor's own ID is NOT in the chain:
      - Augment chain with `(self, self->distcd->epoch)`
@@ -284,32 +286,7 @@ Functions to add in distcd.c:
 
 **How to verify:** Build debug. Run the test programs. Inspect tracing output for trace propagation. Run existing `ci-core` suite to verify no regressions.
 
-### Step 4: Gossip and component merging
-
-**Files changed:** `src/libponyrt/gc/distcd.c`
-
-When an actor's known cycles change:
-1. Compute the connected component: union of all cycles that transitively share members
-2. Send `ACTORMSG_DIST_INFORM` to each other member of the component, carrying the full set of cycles
-
-When receiving `ACTORMSG_DIST_INFORM`:
-1. Union the received cycles with own known cycle set
-2. If the set changed, re-compute the connected component and re-gossip
-
-Component merging algorithm (transitive overlap expansion):
-- Start with any cycle
-- Collect all cycles sharing a member
-- Repeat until no new cycles are added
-- The result is the connected component's member set
-
-Functions to add:
-- `distcd_gossip(pony_ctx_t* ctx, pony_actor_t* actor)` — send INFORM to component members
-- `distcd_handle_inform(pony_ctx_t* ctx, pony_actor_t* actor, cycle_t* cycles, size_t count)` — handle received gossip
-- `distcd_compute_component(distcd_t* d, pony_actor_t*** members_out, size_t* count_out)` — compute connected component from known cycles
-- `distcd_cycle_add(distcd_t* d, cycle_t* cycle)` — add cycle to known set (returns true if new)
-- `distcd_prune_cycles(distcd_t* d, pony_actor_t* dropped_actor)` — remove cycles involving a dropped actor
-
-### Step 5: Confirmation protocol
+### Step 4: Confirmation protocol
 
 **Files changed:** `src/libponyrt/gc/distcd.c`, `src/libponyrt/actor/actor.c`
 
@@ -331,7 +308,7 @@ When a member receives `ACTORMSG_DIST_CONFIRM`:
 
 When the leader receives responses:
 - All CONFIRMED → component confirmed, proceed to destruction
-- Any DENIED → delegate to the first denier via `ACTORMSG_DIST_DELEGATE`
+- Any DENIED → merge the denier's known cycles into own set, re-compute candidate. If candidate expanded, re-determine leadership and retry (or delegate if no longer leader). If candidate did not expand, delegate to the first denier via `ACTORMSG_DIST_DELEGATE`.
 - Delegation: clear own `leading_candidate`, send DELEGATE carrying the candidate
 - Recipient of DELEGATE becomes new leader, re-enters confirmation
 
@@ -340,10 +317,10 @@ Functions to add:
 - `distcd_send_confirm(pony_ctx_t* ctx, pony_actor_t* actor)` — send CONFIRM BLOCKED
 - `distcd_handle_confirm(pony_ctx_t* ctx, pony_actor_t* actor, dist_candidate_msg_t* msg)` — handle CONFIRM BLOCKED
 - `distcd_handle_confirmed(pony_ctx_t* ctx, pony_actor_t* actor, dist_candidate_msg_t* msg)` — handle CONFIRMED
-- `distcd_handle_denied(pony_ctx_t* ctx, pony_actor_t* actor, dist_candidate_msg_t* msg)` — handle DENIED
+- `distcd_handle_denied(pony_ctx_t* ctx, pony_actor_t* actor, dist_denied_msg_t* msg)` — handle DENIED, merge denier's cycles
 - `distcd_handle_delegate(pony_ctx_t* ctx, pony_actor_t* actor, dist_candidate_msg_t* msg)` — handle DELEGATE
 
-### Step 6: Destruction
+### Step 5: Destruction
 
 **Files changed:** `src/libponyrt/gc/distcd.c`, `src/libponyrt/actor/actor.c`
 
@@ -376,7 +353,7 @@ ORCA integration for destruction:
 - This sends `ACTORMSG_RELEASE` (GC protocol) to actors referenced by each member, decrementing their rc
 - Members whose rc drops to 0 self-reap via the existing path
 
-### Step 7: CONNECTION lifecycle and ORCA integration
+### Step 6: CONNECTION lifecycle and ORCA integration
 
 **Files changed:** `src/libponyrt/gc/distcd.c`, `src/libponyrt/gc/gc.c`, `src/libponyrt/gc/actormap.c`
 
@@ -391,7 +368,7 @@ Hook into GC acquire:
 
 **How to verify:** Build debug. Run the full correctness test suite. Run Valgrind to check for leaks and use-after-free. Run existing `ci-core` tests to verify no regressions.
 
-### Step 8: Self-reap guards for distributed mode
+### Step 7: Self-reap guards for distributed mode
 
 **Files changed:** `src/libponyrt/actor/actor.c`
 
@@ -410,7 +387,7 @@ Tests are Pony programs (in `test/full-programs/distributed-cd/` or similar) com
 1. **Self-reap**: actors with rc=0 are destroyed in distributed mode (same as none mode)
 2. **Simple cycle**: A→B→A, both blocked — detected and destroyed
 3. **Longer cycle**: A→B→C→D→A — detected and destroyed
-4. **Overlapping cycles**: A→B→A, B→C→B — component merging produces {A,B,C}, destroyed as one
+4. **Overlapping cycles**: A→B→A, B→C→B — confirmation-driven expansion produces {A,B,C}, destroyed as one
 5. **Active actor in cycle**: A→B→A where A keeps sending — DENIED, no destruction
 6. **External reference into cycle**: A→B→C→B, A is not in the cycle but references B — cycle {B,C} should not be confirmed (B's rc > appearance count)
 7. **Cycle breaks**: A→B→A, then A drops reference to B — cycle pruned, B self-reaps if rc=0
@@ -452,7 +429,7 @@ cd build/debug && ./ponyc -b test_distcd --pic ../../test/full-programs/distribu
 
 ## Phasing
 
-**Single PR.** All steps land together. The mode flag is only useful with the protocol behind it, and detection without destruction is not a meaningful checkpoint. The PR replaces `--ponynoblock` with `--ponycycledetector`, adds the full distributed protocol (trace propagation, gossip, component merging, confirmation, destruction, CONNECTION lifecycle), and includes the complete correctness test suite.
+**Single PR.** All steps land together. The mode flag is only useful with the protocol behind it, and detection without destruction is not a meaningful checkpoint. The PR replaces `--ponynoblock` with `--ponycycledetector`, adds the full distributed protocol (trace propagation, confirmation with denial-driven expansion, destruction, CONNECTION lifecycle), and includes the complete correctness test suite.
 
 **Performance benchmarks** are added alongside or after the PR — they need the full protocol to be meaningful.
 
