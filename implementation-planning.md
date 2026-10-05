@@ -8,7 +8,7 @@ Each actor needs the following state for the protocol:
 
 **Epoch counter.** A monotonic counter, incremented when the actor loses a CONNECTION (GC release or RELEASE processing). Used in TRACE ROUTE entries so recipients can detect stale traces. The counter saturates at its maximum value — the confirmation protocol catches false candidates that slip through under saturation.
 
-**Known cycles.** A set of member-sets — the cycles this actor has detected or learned about via gossip. Populated by local detection (finding itself in a TRACE ROUTE) and by receiving INFORM CYCLES messages. Pruned when a member's topology changes (the cycle is no longer real) or when the actor loses a CONNECTION to a member. Cleared entirely on destruction or ACTOR IDENTIFIER reuse.
+**Known cycles.** A set of member-sets — the cycles this actor has detected or learned about via DENIED confirmation responses. Populated by local detection (finding itself in a TRACE ROUTE) and by cycles received in DENIED messages during confirmation. Pruned when the actor loses a CONNECTION to a member. Cleared entirely on destruction or ACTOR IDENTIFIER reuse.
 
 **Per-CONNECTION trace history.** For each outgoing CONNECTION, the set of trace chains already forwarded on that connection. Used for deduplication: if the chain has already been sent on this connection, don't send it again. Cleared when the CONNECTION is lost. The storage cost and bounding strategy for this history is an open question — see "Trace deduplication bounds" below.
 
@@ -74,14 +74,14 @@ This also needs empirical evaluation. The formal model uses on-acquisition but d
 The formal model verified safety across ~38M states at scope 3. Key findings that constrain implementation choices:
 
 - **Local-only epoch checking is sufficient.** The detecting actor checks only its own epoch entry when a trace returns. Intermediate actors' epochs go unchecked because the implementation has no way to read them. More false candidates reach the confirmation protocol than per-hop checking would allow, but the confirmation protocol catches them. Safety is verified under this weaker check.
-- **Component merging is required for correctness.** Overlapping cycles must be merged before confirmation. Confirming individual overlapping cycles fails because shared members' rc reflects all overlapping cycles.
+- **Overlapping cycles must be confirmed together.** Confirming individual overlapping cycles fails because shared members' rc reflects all overlapping cycles. The leader discovers overlapping cycles lazily through DENIED confirmation responses (each DENIED carries the denier's known cycles) and expands the candidate accordingly.
 - **Confirmation must re-verify at RELEASE time.** Between confirmation and destruction, topology can change. SendRelease re-checks all conditions before initiating destruction.
 - **Chain-content cleanup prevents liveness gaps.** When clearing trace deduplication entries for a dropped CONNECTION, entries where the actor appears anywhere in a chain's visited sequence (not just as sender or target) must also be cleared. Without this, stale entries can suppress valid traces under epoch saturation.
 - **Self-reap guards must check all in-flight references.** Not just messages addressed to the actor — also application message arguments and trace route visited sequences. And the actor must not be referenced in any pending confirmation candidate.
 
 ## What this document does not cover
 
-- **Message format and encoding.** How TRACE ROUTE, CONFIRM BLOCKED, CONFIRMED, DENIED, DELEGATE, RELEASE, and INFORM CYCLES messages are represented in ponyc's message system. This depends on ponyc runtime internals.
+- **Message format and encoding.** How TRACE ROUTE, CONFIRM BLOCKED, CONFIRMED, DENIED, DELEGATE, and RELEASE messages are represented in ponyc's message system. This depends on ponyc runtime internals.
 - **Scheduler integration.** How the protocol's actions (trace initiation, confirmation checks) are triggered by the scheduler. This depends on the trigger policy decision and on scheduler internals.
 - **Testing strategy.** How to test the implementation against the properties verified by the model.
 - **Migration path.** How to transition existing applications from centralized CD to the distributed protocol.

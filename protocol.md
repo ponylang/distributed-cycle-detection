@@ -114,21 +114,11 @@ Upon finding a cycle, the actor checks its set of known cycles to see if the new
 
 When an actor finds a new cycle, it adds it to its set of known cycles.
 
-### Per-actor cycle knowledge and gossip
+### Per-actor cycle knowledge
 
-Each actor maintains its own set of known cycles. This set is populated by local detection (finding a cycle in a received TRACE ROUTE message) and by gossip from other actors.
+Each actor maintains its own set of known cycles. This set is populated by local detection (finding a cycle in a received TRACE ROUTE message) and by cycles received in DENIED confirmation responses.
 
-When an actor's known cycles change, it computes the connected component: all cycles that transitively share at least one member. The actor sends an INFORM CYCLES message to each other member of the component, carrying the full set of cycles that make up the component. The recipient unions the received cycles with its own known cycle set.
-
-An actor removes a cycle from its known cycle set when it learns the cycle is no longer valid — a member's topology has changed such that the cycle's members no longer form a real cycle.
-
-### Connected component merging
-
-Overlapping cycles — cycles that share one or more members — are merged into a connected component before entering confirmation. The component's member set is the union of all overlapping cycles' member sets. The component is proposed as a single candidate for confirmation.
-
-Merging is necessary because overlapping cycles cannot be confirmed individually. A shared member's reference count reflects references from all overlapping cycles, not just one. Confirming a single cycle would require the shared member's rc to equal its appearance count in that cycle alone, but the references from other overlapping cycles inflate the count. Only the merged component's total appearance count matches the actual rc.
-
-The connected component is computed by transitive overlap expansion: starting from any cycle, collect all cycles that share a member with it, then all cycles that share a member with those, and so on until no more cycles are added. The result is the same regardless of which cycle starts the expansion.
+An actor removes a cycle from its known cycle set when it loses a CONNECTION to a member of that cycle (see CONNECTION lifecycle).
 
 ## Leadership determination
 
@@ -145,9 +135,11 @@ All confirmation messages carry a candidate record that identifies the component
 
 - If at the end of any scheduler run, the leader of a component has an empty queue and rc equal to the number of times it appears in the component then it will initiate a CONFIRM BLOCKED.
 - CONFIRM BLOCKED involves sending a message from the leader to each member of the component, carrying the candidate record.
-- If receiver has an empty queue, and rc equal to the number of times it is in the component, then it will send a CONFIRMED message to the leader carrying the candidate record. If any of the checks fail, it will send a DENIED to the leader carrying the candidate record.
-- If any actor sends back DENIED, then the leader will make the first DENIED sender the new leader via a DELEGATE message carrying the candidate record. The new leader re-enters confirmation by sending CONFIRM BLOCKED.
+- If receiver has an empty queue, and rc equal to the number of times it is in the component, then it will send a CONFIRMED message to the leader carrying the candidate record. If any of the checks fail, it will send a DENIED to the leader carrying the candidate record. The DENIED message includes the denier's set of known cycles.
+- When the leader receives a DENIED, it merges the denier's cycles into its own known cycle set and re-computes the candidate by expanding to include any newly overlapping members. If the candidate expanded, the leader re-determines leadership over the new candidate and retries (or delegates if it is no longer leader). If the candidate did not expand, the leader delegates to the first DENIED sender via a DELEGATE message. The new leader re-enters confirmation by sending CONFIRM BLOCKED.
 - If all members send back CONFIRMED then the component is confirmed.
+
+A member may deny because its rc exceeds its appearance count in the candidate — this happens when the member belongs to overlapping cycles the leader hasn't discovered yet. The cycles carried in the DENIED response let the leader expand the candidate to account for all internal references, so the rc check can succeed on retry.
 
 Note: component members cannot self-reap during the confirmation window. A member's rc is held above 0 by the other members' references. A member's rc can only drop to 0 during cycle destruction (after RELEASE). If the component breaks (an external actor drops a reference, or a member gets new work), the confirmation check (rc equals component appearance count) will fail and the member sends DENIED.
 
