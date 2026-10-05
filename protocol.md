@@ -116,7 +116,7 @@ When an actor finds a new cycle, it adds it to its set of known cycles.
 
 ### Per-actor cycle knowledge
 
-Each actor maintains its own set of known cycles. This set is populated by local detection (finding a cycle in a received TRACE ROUTE message) and by cycles received in DENIED confirmation responses.
+Each actor maintains its own set of known cycles. This set is populated by local detection (finding a cycle in a received TRACE ROUTE message).
 
 An actor removes a cycle from its known cycle set when it loses a CONNECTION to a member of that cycle (see CONNECTION lifecycle).
 
@@ -135,8 +135,8 @@ All confirmation messages carry a candidate record that identifies the component
 
 - If at the end of any scheduler run, the leader of a component has an empty queue and rc equal to the number of times it appears in the component then it will initiate a CONFIRM BLOCKED.
 - CONFIRM BLOCKED involves sending a message from the leader to each member of the component, carrying the candidate record.
-- If receiver has an empty queue, and rc equal to the number of times it is in the component, then it will send a CONFIRMED message to the leader carrying the candidate record. If any of the checks fail, it will send a DENIED to the leader carrying the candidate record. The DENIED message includes the denier's set of known cycles.
-- When the leader receives a DENIED, it merges the denier's cycles into its own known cycle set and re-computes the candidate by expanding to include any newly overlapping members. If the candidate expanded, the leader re-determines leadership over the new candidate and retries (or delegates if it is no longer leader). If the candidate did not expand, the leader delegates to the first DENIED sender via a DELEGATE message. The new leader re-enters confirmation by sending CONFIRM BLOCKED.
+- If receiver has an empty queue, and rc equal to the number of times it is in the component, then it will send a CONFIRMED message to the leader carrying the candidate record. If any of the checks fail, it will send a DENIED to the leader carrying the candidate record.
+- If any actor sends back DENIED, then the leader will make the first DENIED sender the new leader via a DELEGATE message carrying the candidate record. The new leader re-enters confirmation by sending CONFIRM BLOCKED.
 - If all members send back CONFIRMED then the component is confirmed.
 
 A member may deny because its rc exceeds its appearance count in the candidate — this happens when the member belongs to overlapping cycles the leader hasn't discovered yet. The cycles carried in the DENIED response let the leader expand the candidate to account for all internal references, so the rc check can succeed on retry.
