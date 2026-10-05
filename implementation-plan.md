@@ -128,15 +128,7 @@ typedef struct dist_candidate_msg_t {
   pony_actor_t* leader;
 } dist_candidate_msg_t;
 
-// DENIED: carries a candidate record plus the denier's known cycles
-typedef struct dist_denied_msg_t {
-  pony_msg_t msg;
-  pony_actor_t** members;  // sorted member set
-  size_t member_count;
-  pony_actor_t* leader;
-  cycle_t* cycles;  // denier's known cycles
-  size_t cycle_count;
-} dist_denied_msg_t;
+// CONFIRMED and DENIED also use dist_candidate_msg_t.
 ```
 
 **Allocation and send path**: all protocol message structs and their payloads (`trace_chain_t`, `cycle_t` arrays, member arrays) are allocated with `ponyint_pool_alloc_size()` and freed with `ponyint_pool_free_size()`. The recipient takes ownership of heap-allocated payloads (e.g., `dist_trace_msg_t.chain`) and frees them with the pool allocator after processing. No `malloc`/`free` — all allocations go through the pool allocator for consistency with the runtime's memory model.
@@ -308,7 +300,7 @@ When a member receives `ACTORMSG_DIST_CONFIRM`:
 
 When the leader receives responses:
 - All CONFIRMED → component confirmed, proceed to destruction
-- Any DENIED → merge the denier's known cycles into own set, re-compute candidate. If candidate expanded, re-determine leadership and retry (or delegate if no longer leader). If candidate did not expand, delegate to the first denier via `ACTORMSG_DIST_DELEGATE`.
+- Any DENIED → delegate to the first denier via `ACTORMSG_DIST_DELEGATE`
 - Delegation: clear own `leading_candidate`, send DELEGATE carrying the candidate
 - Recipient of DELEGATE becomes new leader, re-enters confirmation
 
@@ -317,7 +309,7 @@ Functions to add:
 - `distcd_send_confirm(pony_ctx_t* ctx, pony_actor_t* actor)` — send CONFIRM BLOCKED
 - `distcd_handle_confirm(pony_ctx_t* ctx, pony_actor_t* actor, dist_candidate_msg_t* msg)` — handle CONFIRM BLOCKED
 - `distcd_handle_confirmed(pony_ctx_t* ctx, pony_actor_t* actor, dist_candidate_msg_t* msg)` — handle CONFIRMED
-- `distcd_handle_denied(pony_ctx_t* ctx, pony_actor_t* actor, dist_denied_msg_t* msg)` — handle DENIED, merge denier's cycles
+- `distcd_handle_denied(pony_ctx_t* ctx, pony_actor_t* actor, dist_candidate_msg_t* msg)` — handle DENIED
 - `distcd_handle_delegate(pony_ctx_t* ctx, pony_actor_t* actor, dist_candidate_msg_t* msg)` — handle DELEGATE
 
 ### Step 5: Destruction
@@ -429,7 +421,7 @@ cd build/debug && ./ponyc -b test_distcd --pic ../../test/full-programs/distribu
 
 ## Phasing
 
-**Single PR.** All steps land together. The mode flag is only useful with the protocol behind it, and detection without destruction is not a meaningful checkpoint. The PR replaces `--ponynoblock` with `--ponycycledetector`, adds the full distributed protocol (trace propagation, confirmation with denial-driven expansion, destruction, CONNECTION lifecycle), and includes the complete correctness test suite.
+**Single PR.** All steps land together. The mode flag is only useful with the protocol behind it, and detection without destruction is not a meaningful checkpoint. The PR replaces `--ponynoblock` with `--ponycycledetector`, adds the full distributed protocol (trace propagation, confirmation, destruction, CONNECTION lifecycle), and includes the complete correctness test suite.
 
 **Performance benchmarks** are added alongside or after the PR — they need the full protocol to be meaningful.
 
