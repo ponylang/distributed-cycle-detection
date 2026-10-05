@@ -139,8 +139,6 @@ All confirmation messages carry a candidate record that identifies the component
 - If any actor sends back DENIED, then the leader will make the first DENIED sender the new leader via a DELEGATE message carrying the candidate record. The new leader re-enters confirmation by sending CONFIRM BLOCKED.
 - If all members send back CONFIRMED then the component is confirmed.
 
-A member may deny because its rc exceeds its appearance count in the candidate — this happens when the member belongs to overlapping cycles the leader hasn't discovered yet. The cycles carried in the DENIED response let the leader expand the candidate to account for all internal references, so the rc check can succeed on retry.
-
 Note: component members cannot self-reap during the confirmation window. A member's rc is held above 0 by the other members' references. A member's rc can only drop to 0 during cycle destruction (after RELEASE). If the component breaks (an external actor drops a reference, or a member gets new work), the confirmation check (rc equals component appearance count) will fail and the member sends DENIED.
 
 ## Component destruction
